@@ -24,7 +24,7 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
 
     batch_size, batch_length = rewards.shape[:2]
     # gae_step = torch.zeros((batch_size, ), dtype=dtype, device="cuda")
-    gamma_return = torch.zeros((batch_size, batch_length+1), dtype=dtype, device="cuda")
+    gamma_return = torch.zeros((batch_size, batch_length+1), dtype=dtype, device=rewards.device)
     gamma_return[:, -1] = values[:, -1]
     for t in reversed(range(batch_length)):  # with last bootstrap
         gamma_return[:, t] = \
@@ -41,7 +41,7 @@ class ActorCriticAgent(nn.Module):
         self.lambd = lambd
         self.entropy_coef = entropy_coef
         self.use_amp = True
-        self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
 
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
 
@@ -113,7 +113,7 @@ class ActorCriticAgent(nn.Module):
     @torch.no_grad()
     def sample(self, latent, greedy=False):
         self.eval()
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             logits = self.policy(latent)
             dist = distributions.Categorical(logits=logits)
             if greedy:
@@ -131,7 +131,7 @@ class ActorCriticAgent(nn.Module):
         Update policy and value model
         '''
         self.train()
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             logits, raw_value = self.get_logits_raw_value(latent)
             dist = distributions.Categorical(logits=logits[:, :-1])
             log_prob = dist.log_prob(action)
@@ -150,7 +150,7 @@ class ActorCriticAgent(nn.Module):
             lower_bound = self.lowerbound_ema(percentile(lambda_return, 0.05))
             upper_bound = self.upperbound_ema(percentile(lambda_return, 0.95))
             S = upper_bound-lower_bound
-            norm_ratio = torch.max(torch.ones(1).cuda(), S)  # max(1, S) in the paper
+            norm_ratio = torch.max(torch.ones(1).to(latent.device), S)  # max(1, S) in the paper
             norm_advantage = (lambda_return-value[:, :-1]) / norm_ratio
             policy_loss = -(log_prob * norm_advantage.detach()).mean()
 
@@ -168,10 +168,64 @@ class ActorCriticAgent(nn.Module):
 
         self.update_slow_critic()
 
-        if logger is not None:
-            logger.log('ActorCritic/policy_loss', policy_loss.item())
-            logger.log('ActorCritic/value_loss', value_loss.item())
-            logger.log('ActorCritic/entropy_loss', entropy_loss.item())
-            logger.log('ActorCritic/S', S.item())
-            logger.log('ActorCritic/norm_ratio', norm_ratio.item())
-            logger.log('ActorCritic/total_loss', loss.item())
+        logs = {
+            'actor_critic/policy_loss': policy_loss.item(),
+            'actor_critic/value_loss': value_loss.item(),
+            'actor_critic/entropy_loss': entropy_loss.item(),
+            'actor_critic/raw_norm_ratio': S.item(),
+            'actor_critic/norm_ratio': norm_ratio.item(),
+            'actor_critic/total_loss': loss.item()
+        }
+        return logs
+
+
+class TransformerWithCLS(nn.Module):
+    def __init__(self, in_features, d_model, num_heads, num_layers, norm_first=False):
+        super(TransformerWithCLS, self).__init__()
+        self._linear = nn.Linear(in_features, d_model)
+        self._cls_token = nn.Parameter(torch.zeros(d_model))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, num_heads,
+            #norm_first=norm_first
+        )
+        self._trans = nn.TransformerEncoder(encoder_layer, num_layers)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        B, L = state.shape[:2]
+        state = rearrange(state, "B L N D -> (B L) N D")
+
+        state = self._linear(state)
+        state = torch.cat(
+            [self._cls_token.repeat(B*L, 1, 1), state], dim=1
+        )
+        state = rearrange(state, "B N D -> N B D")
+
+        feats = self._trans(state)[0]
+        feats = rearrange(feats, "(B L) D -> B L D", B=B)
+
+        return feats
+
+
+class OCActorCriticAgent(ActorCriticAgent):
+    def __init__(self, feat_dim, num_heads, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
+        super().__init__(feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef)
+
+        actor = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
+        self.actor = nn.Sequential(
+            actor,
+            nn.Linear(hidden_dim, action_dim)
+        )
+
+        critic = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
+        self.critic = nn.Sequential(
+            critic,
+            nn.Linear(hidden_dim, 255)
+        )
+
+        self.slow_critic = copy.deepcopy(self.critic)
+
+        self.lowerbound_ema = EMAScalar(decay=0.99)
+        self.upperbound_ema = EMAScalar(decay=0.99)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=3e-5, eps=1e-5)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)

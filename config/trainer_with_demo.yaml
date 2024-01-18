@@ -1,0 +1,58 @@
+wandb:
+  mode: online
+  project: STORM
+  entity: null
+  name: null
+  group: null
+  tags: null
+  notes: null
+
+initialization:
+  resume_ckpt: null
+
+common:
+  max_steps: 102000
+  seed: 0
+  image_size: 64
+  device: cuda:0
+  resume: False
+
+envs:
+  env_name: null
+  num_envs: 1
+
+replay_buffer:
+  _target_: replay_buffer.ReplayBuffer
+  max_length: 100000
+  warmup_length: 1024
+  store_on_gpu: True
+
+training:
+  batch_size: 16
+  demonstration_batch_size: 4
+  batch_length: 64
+  imagine_batch_size: 1024
+  imagine_demonstration_batch_size: 256
+  imagine_context_length: 8
+  imagine_batch_length: 16
+  train_dynamics_every_steps: 1
+  train_agent_every_steps: 1
+  save_every_steps: 2500
+  use_demonstration: True
+  trajectory_path: null #TODO:
+
+world_model:
+  _target_: sub_models.world_models.WorldModel
+  in_channels: 3
+  transformer_max_length: 64
+  transformer_hidden_dim: 512
+  transformer_num_layers: 2
+  transformer_num_heads: 8
+
+agent:
+  _target_: agents.ActorCriticAgent
+  num_layers: 2
+  hidden_dim: 512
+  gamma: 0.985
+  lambd: 0.95
+  entropy_coef: 3.0e-4

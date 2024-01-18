@@ -19,6 +19,23 @@ def get_subsequent_mask_with_batch_length(batch_length, device):
     return subsequent_mask
 
 
+def get_causal_mask(seq):
+    ''' For masking out the subsequent info w/ block. '''
+    batch_size, batch_length, num_slots = seq.shape[:3]
+    subsequent_ = torch.tril(torch.ones((1, batch_length, batch_length)), diagonal=1)
+    block_ = torch.block_diag(*[torch.ones(num_slots, num_slots) for _ in range(batch_length)]).unsqueeze(0)
+    mask = torch.max(subsequent_, block_).bool().to(seq.device)
+    return mask
+
+
+def get_causal_mask_with_batch_length(batch_length, num_slots, device):
+    ''' For masking out the subsequent info w/ block. '''
+    subsequent_ = torch.tril(torch.ones((1, batch_length*num_slots, batch_length*num_slots)), diagonal=1)
+    block_ = torch.block_diag(*[torch.ones(num_slots, num_slots) for _ in range(batch_length)]).unsqueeze(0)
+    mask = torch.max(subsequent_, block_).bool().to(device)
+    return mask
+
+
 def get_vector_mask(batch_length, device):
     mask = torch.ones((1, 1, batch_length), device=device).bool()
     # mask = torch.ones((1, batch_length, 1), device=device).bool()
@@ -37,7 +54,7 @@ class ScaledDotProductAttention(nn.Module):
         attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
 
         if mask is not None:
-            attn = attn.masked_fill(mask == 0, -1e9)
+            attn = attn.masked_fill(mask == 0, -6e4)
 
         attn = self.dropout(F.softmax(attn, dim=-1))
         output = torch.matmul(attn, v)
@@ -170,3 +187,57 @@ class PositionalEncoding1D(nn.Module):
 
         feat = feat + pos_emb[:, position:position+1, :]
         return feat
+
+
+class OCPositionalEncoding1D(nn.Module):
+    def __init__(
+        self,
+        max_length: int,
+        num_slots: int,
+        embed_dim: int
+    ):
+        super().__init__()
+        self.max_length = max_length
+        self.num_slots = num_slots
+        self.embed_dim = embed_dim
+
+        self.pos_emb = nn.Embedding(self.max_length*self.num_slots, embed_dim)
+
+    def forward(self, feat):
+        pos_emb = self.pos_emb(torch.arange(self.max_length*self.num_slots, device=feat.device))
+        pos_emb = repeat(pos_emb, "L D -> B L D", B=feat.shape[0])
+
+        feat = feat + pos_emb[:, :feat.shape[1], :]
+        return feat
+
+    def forward_with_position(self, feat, position):
+        pos_emb = self.pos_emb(torch.arange(self.max_length*self.num_slots, device=feat.device))
+        pos_emb = repeat(pos_emb, "L D -> B L D", B=feat.shape[0])
+
+        feat = feat + pos_emb[:, position:position+self.num_slots, :]
+        return feat
+    
+class PositionalEncoding2D(nn.Module):
+    def __init__(self, resolution, channels):
+        super().__init__()
+        height, width = resolution
+        east = torch.linspace(0, 1, width).repeat(height)
+        west = torch.linspace(1, 0, width).repeat(height)
+        south = torch.linspace(0, 1, height).repeat(width)
+        north = torch.linspace(1, 0, height).repeat(width)
+        east = east.reshape(height, width)
+        west = west.reshape(height, width)
+        south = south.reshape(width, height).T
+        north = north.reshape(width, height).T
+        # (4, h, w)
+        linear_pos_embedding = torch.stack([north, south, west, east], dim=0)
+        linear_pos_embedding.unsqueeze_(0)  # for batch size
+        self.channels_map = nn.Conv2d(4, channels, kernel_size=1)
+        self.register_buffer("linear_position_embedding", linear_pos_embedding)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bs_linear_position_embedding = self.linear_position_embedding.expand(
+            x.size(0), 4, x.size(2), x.size(3)
+        )
+        x = x + self.channels_map(bs_linear_position_embedding)
+        return x

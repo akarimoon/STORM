@@ -1,9 +1,6 @@
 torch
 torchaudio
 torchvision
-yacs
-tensorboardX
-tensorboard
 moviepy
 colorama
 einops

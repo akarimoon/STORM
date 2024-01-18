@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,11 +6,11 @@ from torch.distributions import OneHotCategorical, Normal
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 from torch.cuda.amp import autocast
+import wandb
 
 from sub_models.functions_losses import SymLogTwoHotLoss
 from sub_models.attention_blocks import get_subsequent_mask_with_batch_length, get_subsequent_mask
 from sub_models.transformer_model import StochasticTransformerKVCache
-import agents
 
 
 class EncoderBN(nn.Module):
@@ -119,11 +120,11 @@ class DistHead(nn.Module):
     '''
     Dist: abbreviation of distribution
     '''
-    def __init__(self, image_feat_dim, transformer_hidden_dim, stoch_dim) -> None:
+    def __init__(self, image_feat_dim, transformer_hidden_dim, stoch_num_classes, stoch_dim) -> None:
         super().__init__()
         self.stoch_dim = stoch_dim
-        self.post_head = nn.Linear(image_feat_dim, stoch_dim*stoch_dim)
-        self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
+        self.post_head = nn.Linear(image_feat_dim, stoch_num_classes*stoch_dim)
+        self.prior_head = nn.Linear(transformer_hidden_dim, stoch_num_classes*stoch_dim)
 
     def unimix(self, logits, mixing_ratio=0.01):
         # uniform noise mixing
@@ -134,13 +135,13 @@ class DistHead(nn.Module):
 
     def forward_post(self, x):
         logits = self.post_head(x)
-        logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
+        logits = rearrange(logits, "B L (K C) -> B L K C", C=self.stoch_dim)
         logits = self.unimix(logits)
         return logits
 
     def forward_prior(self, x):
         logits = self.prior_head(x)
-        logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
+        logits = rearrange(logits, "B L (K C) -> B L K C", C=self.stoch_dim)
         logits = self.unimix(logits)
         return logits
 
@@ -165,7 +166,7 @@ class RewardDecoder(nn.Module):
 
 
 class TerminationDecoder(nn.Module):
-    def __init__(self,  embedding_size, transformer_hidden_dim) -> None:
+    def __init__(self, embedding_size, transformer_hidden_dim) -> None:
         super().__init__()
         self.backbone = nn.Sequential(
             nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
@@ -214,15 +215,16 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, in_channels, action_dim,
+    def __init__(self, in_channels, action_dim, stoch_num_classes, stoch_dim, 
                  transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads):
         super().__init__()
         self.transformer_hidden_dim = transformer_hidden_dim
         self.final_feature_width = 4
-        self.stoch_dim = 32
-        self.stoch_flattened_dim = self.stoch_dim*self.stoch_dim
+        self.stoch_num_classes = stoch_num_classes
+        self.stoch_dim = stoch_dim
+        self.stoch_flattened_dim = self.stoch_num_classes*self.stoch_dim
         self.use_amp = True
-        self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
 
@@ -243,6 +245,7 @@ class WorldModel(nn.Module):
         self.dist_head = DistHead(
             image_feat_dim=self.encoder.last_channels*self.final_feature_width*self.final_feature_width,
             transformer_hidden_dim=transformer_hidden_dim,
+            stoch_num_classes=stoch_num_classes,
             stoch_dim=self.stoch_dim
         )
         self.image_decoder = DecoderBN(
@@ -270,8 +273,11 @@ class WorldModel(nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
+        self.agent_input_dim = self.stoch_flattened_dim + self.transformer_hidden_dim
+
+
     def encode_obs(self, obs):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
@@ -279,7 +285,7 @@ class WorldModel(nn.Module):
         return flattened_sample
 
     def calc_last_dist_feat(self, latent, action):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             temporal_mask = get_subsequent_mask(latent)
             dist_feat = self.storm_transformer(latent, action, temporal_mask)
             last_dist_feat = dist_feat[:, -1:]
@@ -289,7 +295,7 @@ class WorldModel(nn.Module):
         return prior_flattened_sample, last_dist_feat
 
     def predict_next(self, last_flattened_sample, action, log_video=True):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
             prior_logits = self.dist_head.forward_prior(dist_feat)
 
@@ -320,7 +326,7 @@ class WorldModel(nn.Module):
     def flatten_sample(self, sample):
         return rearrange(sample, "B L K C -> B L (K C)")
 
-    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype):
+    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
         '''
         This can slightly improve the efficiency of imagine_data
         But may vary across different machines
@@ -332,25 +338,24 @@ class WorldModel(nn.Module):
             latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
             hidden_size = (imagine_batch_size, imagine_batch_length+1, self.transformer_hidden_dim)
             scalar_size = (imagine_batch_size, imagine_batch_length)
-            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device="cuda")
-            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device="cuda")
-            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
+            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
+            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device=device)
+            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
-    def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action,
-                     imagine_batch_size, imagine_batch_length, log_video, logger):
-        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype)
+    def imagine_data(self, agent, sample_obs, sample_action,
+                     imagine_batch_size, imagine_batch_length, log_video=False, logger=None, return_rollout_as_tensor=False):
+        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device)
         obs_hat_list = []
 
-        self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype)
+        self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=sample_obs.device)
         # context
         context_latent = self.encode_obs(sample_obs)
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
                 context_latent[:, i:i+1],
                 sample_action[:, i:i+1],
-                log_video=log_video
             )
         self.latent_buffer[:, 0:1] = last_latent
         self.hidden_buffer[:, 0:1] = last_dist_feat
@@ -361,31 +366,35 @@ class WorldModel(nn.Module):
             self.action_buffer[:, i:i+1] = action
 
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
-                self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], log_video=log_video)
+                self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1])
 
             self.latent_buffer[:, i+1:i+2] = last_latent
             self.hidden_buffer[:, i+1:i+2] = last_dist_feat
             self.reward_hat_buffer[:, i:i+1] = last_reward_hat
             self.termination_hat_buffer[:, i:i+1] = last_termination_hat
-            if log_video:
-                obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
 
-        if log_video:
-            logger.log("Imagine/predict_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+        # if log_video:
+            # logger.log("video/rollout", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
 
-        return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
+        #TODO: add ground truth obs
+        rollout = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).unsqueeze(2).cpu().detach() # B T K C H W
+        if not return_rollout_as_tensor:
+            rollout = (rollout * 255.).numpy().astype(np.uint8)
+
+        return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer, rollout
 
     def update(self, obs, action, reward, termination, logger=None):
         self.train()
         batch_size, batch_length = obs.shape[:2]
 
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             # encoding
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
             flattened_sample = self.flatten_sample(sample)
-
+            
             # decoding image
             obs_hat = self.image_decoder(flattened_sample)
 
@@ -414,12 +423,18 @@ class WorldModel(nn.Module):
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
 
-        if logger is not None:
-            logger.log("WorldModel/reconstruction_loss", reconstruction_loss.item())
-            logger.log("WorldModel/reward_loss", reward_loss.item())
-            logger.log("WorldModel/termination_loss", termination_loss.item())
-            logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
-            logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
-            logger.log("WorldModel/representation_loss", representation_loss.item())
-            logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
-            logger.log("WorldModel/total_loss", total_loss.item())
+        video = torch.cat([obs.unsqueeze(2), torch.clamp(obs_hat, 0, 1).unsqueeze(2)], dim=2).cpu().detach() # B T K C H W
+        video = (video * 255.).numpy().astype(np.uint8)
+
+        logs = {
+            "world_model/reconstruction_loss": reconstruction_loss.item(),
+            "world_model/reward_loss": reward_loss.item(),
+            "world_model/termination_loss": termination_loss.item(),
+            "world_model/dynamics_loss": dynamics_loss.item(),
+            "world_model/dynamics_real_kl_div": dynamics_real_kl_div.item(),
+            "world_model/representation_loss": representation_loss.item(),
+            "world_model/representation_real_kl_div": representation_real_kl_div.item(),
+            "world_model/total_loss": total_loss.item(),
+        }
+
+        return logs, video

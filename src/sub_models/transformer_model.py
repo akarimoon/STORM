@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from einops import repeat, rearrange
 
 from sub_models.attention_blocks import get_vector_mask
-from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache
+from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache, OCPositionalEncoding1D
 
 
 class StochasticTransformer(nn.Module):
@@ -75,13 +75,13 @@ class StochasticTransformerKVCache(nn.Module):
 
         return feats
 
-    def reset_kv_cache_list(self, batch_size, dtype):
+    def reset_kv_cache_list(self, batch_size, dtype, device):
         '''
         Reset self.kv_cache_list
         '''
         self.kv_cache_list = []
         for layer in self.layer_stack:
-            self.kv_cache_list.append(torch.zeros(size=(batch_size, 0, self.feat_dim), dtype=dtype, device="cuda"))
+            self.kv_cache_list.append(torch.zeros(size=(batch_size, 0, self.feat_dim), dtype=dtype, device=device))
 
     def forward_with_kv_cache(self, samples, action):
         '''
@@ -99,4 +99,78 @@ class StochasticTransformerKVCache(nn.Module):
             self.kv_cache_list[idx] = torch.cat([self.kv_cache_list[idx], feats], dim=1)
             feats, attn = layer(feats, self.kv_cache_list[idx], self.kv_cache_list[idx], mask)
 
+        return feats
+    
+
+class OCStochasticTransformerKVCache(nn.Module):
+    def __init__(self, stoch_dim, action_dim, feat_dim, num_slots, num_layers, num_heads, max_length, dropout):
+        super().__init__()
+        self.action_dim = action_dim
+        self.feat_dim = feat_dim
+        self.num_slots = num_slots
+
+        # mix image_embedding and action
+        self.stem = nn.Sequential(
+            nn.Linear(stoch_dim+action_dim, feat_dim, bias=False),
+            nn.LayerNorm(feat_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feat_dim, feat_dim, bias=False),
+            nn.LayerNorm(feat_dim)
+        )
+        self.position_encoding = OCPositionalEncoding1D(max_length=max_length, num_slots=num_slots, embed_dim=feat_dim)
+        self.layer_stack = nn.ModuleList([
+            AttentionBlockKVCache(feat_dim=feat_dim, hidden_dim=feat_dim*2, num_heads=num_heads, dropout=dropout) for _ in range(num_layers)
+        ])
+        self.layer_norm = nn.LayerNorm(feat_dim, eps=1e-6)  # TODO: check if this is necessary
+
+    def forward(self, samples, action, mask):
+        '''
+        Normal forward pass
+
+        samples: (B, L, N, D)
+        action: (B, L, 1)
+        '''
+        B, L, N, D = samples.shape
+
+        action = F.one_hot(action.long(), self.action_dim).float()
+        action = repeat(action, "B L A -> B L N A", N=N)
+        feats = self.stem(torch.cat([samples, action], dim=-1))
+        feats = rearrange(feats, "B L K D -> B (L K) D")
+        feats = self.position_encoding(feats)
+        feats = self.layer_norm(feats)
+
+        for layer in self.layer_stack:
+            feats, attn = layer(feats, feats, feats, mask)
+
+        feats = rearrange(feats, "B (L K) D -> B L K D", L=L)
+        return feats
+
+    def reset_kv_cache_list(self, batch_size, dtype, device):
+        '''
+        Reset self.kv_cache_list
+        '''
+        self.kv_cache_list = []
+        for layer in self.layer_stack:
+            self.kv_cache_list.append(torch.zeros(size=(batch_size, 0, self.feat_dim), dtype=dtype, device=device))
+
+    def forward_with_kv_cache(self, samples, action):
+        '''
+        Forward pass with kv_cache, cache stored in self.kv_cache_list
+        '''
+        assert samples.shape[1] == 1
+        mask = get_vector_mask(self.kv_cache_list[0].shape[1]+self.num_slots, samples.device)
+
+        B, L, N, D = samples.shape
+        action = F.one_hot(action.long(), self.action_dim).float()
+        action = repeat(action, "B L A -> B L N A", N=N)
+        feats = self.stem(torch.cat([samples, action], dim=-1))
+        feats = rearrange(feats, "B L K D -> B (L K) D")
+        feats = self.position_encoding.forward_with_position(feats, position=self.kv_cache_list[0].shape[1])
+        feats = self.layer_norm(feats)
+
+        for idx, layer in enumerate(self.layer_stack):
+            self.kv_cache_list[idx] = torch.cat([self.kv_cache_list[idx], feats], dim=1)
+            feats, attn = layer(feats, self.kv_cache_list[idx], self.kv_cache_list[idx], mask)
+
+        feats = rearrange(feats, "B (L K) D -> B L K D", L=L)
         return feats

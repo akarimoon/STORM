@@ -8,13 +8,13 @@ import pickle
 
 
 class ReplayBuffer():
-    def __init__(self, obs_shape, num_envs, max_length=int(1E6), warmup_length=50000, store_on_gpu=False) -> None:
+    def __init__(self, obs_shape, num_envs, max_length=int(1E6), warmup_length=50000, store_on_gpu=False, device="cuda") -> None:
         self.store_on_gpu = store_on_gpu
         if store_on_gpu:
-            self.obs_buffer = torch.empty((max_length//num_envs, num_envs, *obs_shape), dtype=torch.uint8, device="cuda", requires_grad=False)
-            self.action_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
-            self.reward_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
-            self.termination_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
+            self.obs_buffer = torch.empty((max_length//num_envs, num_envs, *obs_shape), dtype=torch.uint8, device=device, requires_grad=False)
+            self.action_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device=device, requires_grad=False)
+            self.reward_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device=device, requires_grad=False)
+            self.termination_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device=device, requires_grad=False)
         else:
             self.obs_buffer = np.empty((max_length//num_envs, num_envs, *obs_shape), dtype=np.uint8)
             self.action_buffer = np.empty((max_length//num_envs, num_envs), dtype=np.float32)
@@ -27,11 +27,12 @@ class ReplayBuffer():
         self.max_length = max_length
         self.warmup_length = warmup_length
         self.external_buffer_length = None
+        self.device = device
 
     def load_trajectory(self, path):
         buffer = pickle.load(open(path, "rb"))
         if self.store_on_gpu:
-            self.external_buffer = {name: torch.from_numpy(buffer[name]).to("cuda") for name in buffer}
+            self.external_buffer = {name: torch.from_numpy(buffer[name]).to(self.device) for name in buffer}
         else:
             self.external_buffer = buffer
         self.external_buffer_length = self.external_buffer["obs"].shape[0]
@@ -96,11 +97,11 @@ class ReplayBuffer():
                 reward.append(external_reward)
                 termination.append(external_termination)
 
-            obs = torch.from_numpy(np.concatenate(obs, axis=0)).float().cuda() / 255
+            obs = torch.from_numpy(np.concatenate(obs, axis=0)).float().to(self.device) / 255
             obs = rearrange(obs, "B T H W C -> B T C H W")
-            action = torch.from_numpy(np.concatenate(action, axis=0)).cuda()
-            reward = torch.from_numpy(np.concatenate(reward, axis=0)).cuda()
-            termination = torch.from_numpy(np.concatenate(termination, axis=0)).cuda()
+            action = torch.from_numpy(np.concatenate(action, axis=0)).to(self.device)
+            reward = torch.from_numpy(np.concatenate(reward, axis=0)).to(self.device)
+            termination = torch.from_numpy(np.concatenate(termination, axis=0)).to(self.device)
 
         return obs, action, reward, termination
 
