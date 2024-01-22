@@ -25,6 +25,7 @@ envs:
   env_type: ocrl
   env_name: target-N4C4S3S1
   num_envs: 1
+  max_step: 1000
 
 replay_buffer:
   _target_: replay_buffer.ReplayBuffer

@@ -67,6 +67,27 @@ class MaxLast2FrameSkipWrapper(gymnasium.Wrapper):
         else:
             obs = np.max(np.stack(self.obs_buffer), axis=0)
         return obs, total_reward, done, truncated, info
+    
+
+class OCRLMaxStepWrapper(gymnasium.Wrapper):
+    def __init__(self, env, max_step):
+        super().__init__(env)
+        self.max_step = max_step
+        self.current_step = 0
+
+    def reset(self, **kwargs):
+        self.current_step = 0
+        obs, _ = self.env.reset(**kwargs)
+        return obs, _
+
+    def step(self, action):
+        obs, reward, done, truncated, info = self.env.step(action)
+        self.current_step += 1
+        done = False
+        if self.current_step >= self.max_step:
+            done = True
+        return obs, reward, done, truncated, info
+
 
 def build_single_env(env_name, image_size):
     env = gymnasium.make(env_name, full_action_space=True, frameskip=1)
