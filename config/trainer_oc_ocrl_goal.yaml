@@ -4,7 +4,7 @@ defaults:
 
 wandb:
   mode: online
-  project: STORM
+  project: STORM-OCRL
   entity: null
   name: null
   group: null
@@ -43,17 +43,22 @@ training:
   imagine_batch_length: 16
   train_dynamics_every_steps: 1
   train_agent_every_steps: 1
+  use_demonstration: False
+  trajectory_path: null
+  #############################
   save_every_steps: 2500
   vis_every_steps: 1000
   inspect_every_steps: 1000
-  use_demonstration: False
-  trajectory_path: null
 
 world_model:
   _target_: sub_models.oc_world_models.OCWorldModel
+  lr_storm: 0.0001
+  lr_sa: 0.0001
+  max_grad_norm_storm: 1000
+  max_grad_norm_sa: 1000
   in_channels: 3
-  stoch_num_classes: 32
-  stoch_dim: 32
+  stoch_num_classes: 16
+  stoch_dim: 64
   num_slots: 7
   slot_dim: 128
   transformer_max_length: 64

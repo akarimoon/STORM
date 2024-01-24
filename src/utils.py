@@ -1,7 +1,8 @@
-import torch
 import os
-import numpy as np
 import random
+from typing import Optional
+import numpy as np
+import torch
 from einops import repeat
 from contextlib import contextmanager
 import time
@@ -104,3 +105,17 @@ class EMAScalar():
 #     conf.freeze()
 
 #     return conf
+
+def linear_warmup_exp_decay(warmup_steps: Optional[int] = None, exp_decay_rate: Optional[float] = None, exp_decay_steps: Optional[int] = None):
+    assert (exp_decay_steps is None) == (exp_decay_rate is None)
+    use_exp_decay = exp_decay_rate is not None
+    if warmup_steps is not None:
+        assert warmup_steps > 0
+    def lr_lambda(step):
+        multiplier = 1.0
+        if warmup_steps is not None and step < warmup_steps:
+            multiplier *= step / warmup_steps
+        if use_exp_decay:
+            multiplier *= exp_decay_rate ** (step / exp_decay_steps)
+        return multiplier
+    return lr_lambda

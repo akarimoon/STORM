@@ -13,6 +13,7 @@ from sub_models.functions_losses import SymLogTwoHotLoss
 from sub_models.attention_blocks import get_causal_mask_with_batch_length, get_causal_mask, PositionalEncoding1D, PositionalEncoding2D
 from sub_models.transformer_model import OCStochasticTransformerKVCache
 from sub_models.transformer_utils import SLATETransformerDecoder, SLATETransformerDecoderKVCache, resize_patches_to_image
+from utils import linear_warmup_exp_decay
 
 class EncoderBN(nn.Module):
     def __init__(self, in_channels, stem_channels, final_feature_width) -> None:
@@ -252,11 +253,16 @@ class DistHead(nn.Module):
     '''
     Dist: abbreviation of distribution
     '''
-    def __init__(self, image_feat_dim, transformer_hidden_dim, stoch_num_classes, stoch_dim) -> None:
+    def __init__(self, image_feat_dim, transformer_hidden_dim, sbd_hidden_dim, stoch_num_classes, stoch_dim) -> None:
         super().__init__()
         self.stoch_dim = stoch_dim
         self.post_head = nn.Linear(image_feat_dim, stoch_num_classes*stoch_dim)
-        # self.prior_head = nn.Linear(transformer_hidden_dim, stoch_num_classes*stoch_dim)
+        self.prior_head = SpatialBroadcastMLPDecoder(
+            dec_input_dim=transformer_hidden_dim,
+            dec_hidden_layers=[sbd_hidden_dim, sbd_hidden_dim, sbd_hidden_dim],
+            stoch_num_classes=stoch_num_classes,
+            stoch_dim=stoch_dim
+        )
 
     def unimix(self, logits, mixing_ratio=0.01):
         # uniform noise mixing
@@ -271,11 +277,13 @@ class DistHead(nn.Module):
         logits = self.unimix(logits)
         return logits
 
-    def forward_prior(self, logits):
-        # logits = self.prior_head(x)
-        # logits = rearrange(logits, "B L (K C) -> B L K C", C=self.stoch_dim)
+    def forward_prior(self, x):
+        batch_size = x.shape[0]
+        x = rearrange(x, "B L N D -> (B L) N D")
+        logits, _, mask_as_image = self.prior_head(x)
+        logits = rearrange(logits, "(B L) K C -> B L K C", B=batch_size)
         logits = self.unimix(logits)
-        return logits
+        return logits, None, mask_as_image
 
 
 class RewardDecoder(nn.Module):
@@ -350,7 +358,8 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 class OCWorldModel(nn.Module):
     def __init__(self, in_channels, action_dim, stoch_num_classes, stoch_dim, num_slots, slot_dim,
-                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads, sbd_hidden_dim):
+                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads, sbd_hidden_dim, 
+                 lr_storm, lr_sa, max_grad_norm_storm, max_grad_norm_sa) -> None:
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -388,6 +397,7 @@ class OCWorldModel(nn.Module):
         self.dist_head = DistHead(
             image_feat_dim=self.encoder.last_channels*self.final_feature_width*self.final_feature_width,
             transformer_hidden_dim=transformer_hidden_dim,
+            sbd_hidden_dim=sbd_hidden_dim,
             stoch_num_classes=stoch_num_classes,
             stoch_dim=self.stoch_dim
         )
@@ -409,32 +419,24 @@ class OCWorldModel(nn.Module):
             input_dim=transformer_hidden_dim*self.num_slots,
             hidden_dim=transformer_hidden_dim
         )
-        self.spatial_decoder = SpatialBroadcastMLPDecoder(
-            dec_input_dim=transformer_hidden_dim,
-            dec_hidden_layers=[sbd_hidden_dim, sbd_hidden_dim, sbd_hidden_dim],
-            stoch_num_classes=stoch_num_classes,
-            stoch_dim=self.stoch_dim
-        )        
-
-        # self.enc_position_encoding = nn.Sequential(
-        #     PositionalEncoding1D(max_length=1+self.stoch_num_classes, embed_dim=self.stoch_dim),
-        #     nn.Dropout(0.1)
-        # )
-        # self.dec_position_encoding = nn.Sequential(
-        #     PositionalEncoding1D(max_length=1+self.stoch_num_classes, embed_dim=self.stoch_dim),
-        #     nn.Dropout(0.1)
-        # )
-        # self.enc_bos = nn.Parameter(torch.Tensor(1, 1, self.stoch_dim))
-        # nn.init.xavier_uniform_(self.enc_bos)
-        # self.dec_bos = nn.Parameter(torch.Tensor(1, 1, self.stoch_dim))
-        # nn.init.xavier_uniform_(self.dec_bos)
 
         self.mse_loss_func = MSELoss()
         self.ce_loss = nn.CrossEntropyLoss()
         self.bce_with_logits_loss_func = nn.BCEWithLogitsLoss()
         self.symlog_twohot_loss_func = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
         self.categorical_kl_div_loss = CategoricalKLDivLossWithFreeBits(free_bits=1)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        
+        self.optimizer_storm = torch.optim.Adam(
+            list(self.encoder.parameters()) + list(self.storm_transformer.parameters()) + list(self.image_decoder.parameters()) + \
+            list(self.dist_head.parameters()) + list(self.reward_decoder.parameters()) + list(self.termination_decoder.parameters()),
+            lr=lr_storm
+        )
+        self.optimizer_sa = torch.optim.Adam(self.slot_attn.parameters(), lr=lr_sa)
+        self.scheduler_storm = None
+        self.scheduler_sa = torch.optim.lr_scheduler.LambdaLR(self.optimizer_sa, lr_lambda=linear_warmup_exp_decay(10000, 0.5, 100000))
+        self.max_grad_norm_storm = max_grad_norm_storm
+        self.max_grad_norm_sa = max_grad_norm_sa
+
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
         self.agent_input_dim = self.slot_dim + self.transformer_hidden_dim
@@ -477,12 +479,8 @@ class OCWorldModel(nn.Module):
             temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, latent.device)
             hidden_hat = self.storm_transformer(slots, action, temporal_mask)
             last_hidden_hat = hidden_hat[:, -1:]
-            last_hidden_hat_reshaped = rearrange(last_hidden_hat, "B L K C -> (B L) K C")
 
-            last_slots_hat, _, _ = self.spatial_decoder(last_hidden_hat_reshaped)
-            last_dist_feat = rearrange(last_slots_hat, "(B L) K C -> B L K C", B=batch_size)
-
-            prior_logits = self.dist_head.forward_prior(last_dist_feat)
+            prior_logits, _, _ = self.dist_head.forward_prior(last_hidden_hat)
             prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
             prior_flattened_sample = self.flatten_sample(prior_sample)
 
@@ -496,11 +494,7 @@ class OCWorldModel(nn.Module):
 
             hidden_hat = self.storm_transformer.forward_with_kv_cache(slots, action)
 
-            hidden_hat_reshaped = rearrange(hidden_hat, "B L N D -> (B L) N D")
-            dist_feat, _, mask_as_image = self.spatial_decoder(hidden_hat_reshaped)   
-            dist_feat = rearrange(dist_feat, "(B L) K C -> B L K C", B=batch_size)
-
-            prior_logits = self.dist_head.forward_prior(dist_feat)
+            prior_logits, _, mask_as_image = self.dist_head.forward_prior(hidden_hat)
             prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
             prior_flattened_sample = self.flatten_sample(prior_sample)
             if log_video:
@@ -630,11 +624,8 @@ class OCWorldModel(nn.Module):
             reward_hat = self.reward_decoder(slots_hat)
             termination_hat = self.termination_decoder(slots_hat)
 
-            # slot space to logits
-            slots_hat = rearrange(slots_hat, "B L N D -> (B L) N D")
-            dist_feat, _, mask_as_image = self.spatial_decoder(slots_hat)   
-            dist_feat = rearrange(dist_feat, "(B L) K C -> B L K C", B=batch_size)         
-            prior_logits = self.dist_head.forward_prior(dist_feat)
+            # slot space to logits   
+            prior_logits, _, mask_as_image = self.dist_head.forward_prior(slots_hat)
 
             # env loss
             reconstruction_loss = self.mse_loss_func(obs_hat, obs)
@@ -654,11 +645,24 @@ class OCWorldModel(nn.Module):
 
         # gradient descent
         self.scaler.scale(total_loss).backward()
-        self.scaler.unscale_(self.optimizer)  # for clip grad
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1000.0)
-        self.scaler.step(self.optimizer)
+        self.scaler.unscale_(self.optimizer_storm)  # for clip grad
+        self.scaler.unscale_(self.optimizer_sa)  # for clip grad
+        torch.nn.utils.clip_grad_norm_(
+            list(self.encoder.parameters()) + list(self.storm_transformer.parameters()) + list(self.image_decoder.parameters()) + \
+            list(self.dist_head.parameters()) + list(self.reward_decoder.parameters()) + list(self.termination_decoder.parameters()), 
+            max_norm=self.max_grad_norm_storm
+        )
+        torch.nn.utils.clip_grad_norm_(self.slot_attn.parameters(), max_norm=self.max_grad_norm_sa)
+        self.scaler.step(self.optimizer_storm)
+        self.scaler.step(self.optimizer_sa)
         self.scaler.update()
-        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer_storm.zero_grad(set_to_none=True)
+        self.optimizer_sa.zero_grad(set_to_none=True)
+
+        if self.scheduler_storm is not None:
+            self.scheduler_storm.step()
+        if self.scheduler_sa is not None:
+            self.scheduler_sa.step()
 
         if self.final_feature_width**2 == self.stoch_num_classes:
             video = torch.cat([obs.unsqueeze(2), torch.clamp(obs_hat, 0, 1).unsqueeze(2), attns], dim=2).cpu().detach() # B L N C H W
