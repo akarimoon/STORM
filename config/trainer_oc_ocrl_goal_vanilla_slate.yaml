@@ -1,0 +1,65 @@
+defaults:
+  - env_config: target-N4C4S3S1
+  - _self_
+
+wandb:
+  mode: online
+  project: STORM-OCRL
+  entity: null
+  name: null
+  group: static
+  tags: null
+  notes: null
+
+initialization:
+  resume_ckpt: null
+
+common:
+  max_steps: 102000
+  seed: 0
+  image_size: 64
+  device: cuda:0
+  resume: False
+
+envs:
+  env_type: ocrl
+  env_name: target-N4C4S3S1
+  num_envs: 1
+  max_step: -1
+
+replay_buffer:
+  _target_: replay_buffer.ReplayBuffer
+  max_length: 100000
+  warmup_length: 1024
+  store_on_gpu: True
+
+training:
+  batch_size: 24
+  demonstration_batch_size: 0
+  batch_length: 1
+  train_dynamics_every_steps: 1
+  use_demonstration: False
+  trajectory_path: null
+  #############################
+  save_every_steps: 2500
+  vis_every_steps: 1000
+  inspect_every_steps: 1000
+
+world_model:
+  _target_: sub_models.vanilla_slate.SLATE
+  lr_vae: 0.0003
+  lr_sa: 0.0001
+  max_grad_norm_vae: 0.05 # or 1
+  max_grad_norm_sa: 0.05 # or 1
+  in_channels: 3
+  stem_channels: 64
+  stoch_num_classes: 256
+  stoch_dim: 192
+  num_slots: 7
+  slot_dim: 192
+  sbd_hidden_dim: 1024
+  sbd_num_layers: 2
+  vocab_size: 4096
+  post_type: autoregressive
+  lr_warmup_steps: 30000
+  tau_anneal_steps: 30000
