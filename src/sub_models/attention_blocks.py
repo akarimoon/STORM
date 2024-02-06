@@ -165,13 +165,16 @@ class PositionalEncoding1D(nn.Module):
     def __init__(
         self,
         max_length: int,
-        embed_dim: int
+        embed_dim: int,
+        weight_init: str = None,
     ):
         super().__init__()
         self.max_length = max_length
         self.embed_dim = embed_dim
 
         self.pos_emb = nn.Embedding(self.max_length, embed_dim)
+        if weight_init == 'trunc_normal':
+            nn.init.trunc_normal_(self.pos_emb.weight)
 
     def forward(self, feat):
         pos_emb = self.pos_emb(torch.arange(self.max_length, device=feat.device))
