@@ -172,6 +172,14 @@ class SlotAttention(nn.Module):
         torch.nn.init.zeros_(self.gru.bias_hh)
         torch.nn.init.orthogonal_(self.gru.weight_hh)
 
+    def _reset_slots(self):
+        self.slots_mu = nn.Parameter(torch.rand((1, 1, self.slot_dim), device=self.slots_mu.device))
+        self.slots_log_sigma = nn.Parameter(torch.randn((1, 1, self.slot_dim), device=self.slots_log_sigma.device))
+        with torch.no_grad():
+            limit = math.sqrt(6.0 / (1 + self.slot_dim))
+            torch.nn.init.uniform_(self.slots_mu, -limit, limit)
+            torch.nn.init.uniform_(self.slots_log_sigma, -limit, limit)
+
     def forward(self, inputs) -> torch.Tensor:
         b, n, d = inputs.shape
 
