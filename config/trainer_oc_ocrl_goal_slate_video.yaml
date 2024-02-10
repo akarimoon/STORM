@@ -1,0 +1,78 @@
+defaults:
+  - env_config: target-N4C4S3S1
+  - _self_
+
+wandb:
+  mode: online
+  project: STORM-OCRL
+  entity: null
+  name: null
+  group: slate_video
+  tags: null
+  notes: null
+
+initialization:
+  resume_ckpt: null
+  pretrained_ckpt: ocrl_slate_pretrained.pth
+
+common:
+  max_steps: 102000
+  seed: 0
+  image_size: 64
+  device: cuda:0
+  resume: False
+  load_pretrained: True
+
+envs:
+  env_type: ocrl
+  env_name: target-N4C4S3S1
+  num_envs: 1
+  max_step: 50
+
+replay_buffer:
+  _target_: replay_buffer.ReplayBuffer
+  max_length: 100000
+  warmup_length: 1024
+  store_on_gpu: True
+
+training:
+  batch_size: 16
+  demonstration_batch_size: 0
+  batch_length: 4
+  train_dynamics_every_steps: 1
+  use_demonstration: False
+  trajectory_path: null
+  #############################
+  save_every_steps: 2500
+  vis_every_steps: 1000
+  inspect_every_steps: 1000
+  inspect_batch_size: 16
+  inspect_demonstration_batch_size: 0
+  inspect_context_length: 2
+  inspect_batch_length: 16
+
+world_model:
+  _target_: sub_models.slate.SLATEWorldModel
+  lr_vae: 0.0003
+  lr_sa: 0.00005
+  lr_tf: 0.0001
+  max_grad_norm_vae: 0.05 
+  max_grad_norm_sa: 0.05
+  max_grad_norm_tf: 1000.0
+  in_channels: 3
+  stem_channels: 64
+  stoch_num_classes: 256
+  stoch_dim: 192
+  num_slots: 7
+  slot_dim: 192
+  dec_hidden_dim: 32
+  dec_num_layers: 2
+  vocab_size: 4096
+  post_type: conv
+  transformer_hidden_dim: 512
+  transformer_num_layers: 2
+  transformer_num_heads: 8
+  transformer_max_length: 64
+  loss_type: slate
+  lr_warmup_steps: 30000
+  tau_anneal_steps: 30000
