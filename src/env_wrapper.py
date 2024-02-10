@@ -83,7 +83,7 @@ class OCRLMaxStepWrapper(gymnasium.Wrapper):
     def step(self, action):
         obs, reward, done, truncated, info = self.env.step(action)
         self.current_step += 1
-        done = False
+        # done = False
         if self.current_step >= self.max_step:
             done = True
         return obs, reward, done, truncated, info
