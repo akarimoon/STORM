@@ -8,7 +8,7 @@ from torch.distributions import OneHotCategorical, RelaxedOneHotCategorical
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sub_models.oc_world_models import SlotAttention, SpatialBroadcastMLPDecoder, MSELoss
+from sub_models.oc_world_models import SlotAttention, MSELoss
 from sub_models.world_models import CategoricalKLDivLossWithFreeBits
 from sub_models.transformer_model import OCStochasticTransformerKVCache
 from sub_models.attention_blocks import PositionalEncoding1D, PositionalEncoding2D, get_causal_mask_with_batch_length
@@ -862,7 +862,7 @@ class SLATEWorldModel(SLATE):
             norm_sa = torch.nn.utils.clip_grad_norm_(self._get_sa_params(), max_norm=self.max_grad_norm_sa, norm_type="inf")
             norm_dec = torch.nn.utils.clip_grad_norm_(self._get_dec_params(), max_norm=self.max_grad_norm_vae, norm_type="inf")
         norm_tf = torch.nn.utils.clip_grad_norm_(self._get_tf_params(), max_norm=self.max_grad_norm_tf)
-        # print(norm_vae, norm_sa, norm_dec, norm_tf)
+        print(norm_vae, norm_sa, norm_dec, norm_tf)
         if not train_only_tf:
             self.scaler.step(self.optimizer_vae)
             self.scaler.step(self.optimizer_sa)
