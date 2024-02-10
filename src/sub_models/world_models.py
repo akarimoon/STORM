@@ -460,7 +460,7 @@ class WorldModel(nn.Module):
 
         return logs, video
     
-    def inspect_reconstruction(self, obs):
+    def inspect_reconstruction(self, obs, tau=None):
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
