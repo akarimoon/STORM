@@ -7,14 +7,13 @@ wandb:
   project: STORM-OCRL
   entity: null
   name: null
-  # group: slate_video_agent
   group: target
   tags: null
   notes: null
 
 initialization:
   resume_ckpt: null
-  pretrained_ckpt: ocrl_slate_pretrained.pth
+  pretrained_ckpt: null
 
 common:
   max_steps: 102000
@@ -22,7 +21,7 @@ common:
   image_size: 64
   device: cuda:0
   resume: False
-  load_pretrained: True
+  load_pretrained: False
 
 envs:
   env_type: ocrl
@@ -58,39 +57,23 @@ training:
   inspect_batch_length: 8
 
 world_model:
-  _target_: sub_models.oc_world_models.OCWorldModel
-  lr_vae: 0.0003
-  lr_sa: 0.0001
-  lr_dec: 0.0001
-  lr_tf: 0.0001
-  max_grad_norm_vae: 0.05 
-  max_grad_norm_sa: 0.05
-  max_grad_norm_dec: 0.05
-  max_grad_norm_tf: 1000.0
+  _target_: sub_models.world_models.WorldModel
+  lr: 0.0001
+  max_grad_norm: 1000.0
   in_channels: 3
-  stem_channels: 64
-  stoch_num_classes: 256
-  stoch_dim: 192
-  num_slots: 7
-  slot_dim: 192
-  dec_hidden_dim: 32
-  dec_num_layers: 2
-  vocab_size: 4096
+  stem_channels: 32
+  stoch_num_classes: 32
+  stoch_dim: 32
+  transformer_max_length: 64
   transformer_hidden_dim: 512
   transformer_num_layers: 2
   transformer_num_heads: 8
-  transformer_max_length: 64
-  loss_type: slate
   agent_state_type: both
-  lr_warmup_steps: -1
-  tau_anneal_steps: -1
-  coef_anneal_steps: 15000
 
 agent:
-  _target_: agents.OCActorCriticAgent
-  num_heads: 8
-  num_layers: 1
-  hidden_dim: 128
+  _target_: agents.ActorCriticAgent
+  num_layers: 2
+  hidden_dim: 512
   gamma: 0.985
   lambd: 0.95
   entropy_coef: 3.0e-4
