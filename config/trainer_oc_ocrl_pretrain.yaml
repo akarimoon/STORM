@@ -49,5 +49,6 @@ world_model:
   dec_num_layers: 2
   vocab_size: 4096
   post_type: conv
+  loss_type: slate
   lr_warmup_steps: 30000
   tau_anneal_steps: 30000
