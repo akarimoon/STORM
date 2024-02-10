@@ -95,12 +95,13 @@ class Trainer:
 
         action_dim = 4
 
-        train_dl, _ = get_dataloaders(
+        train_dl, valid_dl = get_dataloaders(
             Path(hydra.utils.get_original_cwd()),
             cfg.training.batch_size,
             num_workers=2
         )
         self.train_dl = train_dl
+        self.valid_dl = valid_dl
 
         # build world model and agent
         self.world_model = instantiate(cfg.world_model, action_dim=action_dim).to(self.device)
@@ -116,6 +117,11 @@ class Trainer:
             for idx, batch in enumerate(tqdm(self.train_dl)):
                 obs = batch["obss"].to(self.device)
                 self.train_world_model(obs)
+
+                if self.total_steps % (self.cfg.training.inspect_every_steps//self.num_envs) == 0:
+                    valid_batch = next(iter(self.valid_dl))
+                    valid_obs = valid_batch["obss"].to(self.device)
+                    self.inspect_world_model(valid_obs)
 
             self.save()
             self.total_epochs += 1
@@ -139,6 +145,19 @@ class Trainer:
             save_image(full_plot, self.media_dir / f"reconstruction_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
 
         self.total_steps += 1
+
+    @torch.no_grad()
+    def inspect_world_model(self, obs) -> None:
+        self.world_model.eval()
+
+        with torch.no_grad():
+            video = self.world_model.inspect(obs.unsqueeze(1))
+
+        wandb.log({"step": self.total_steps//self.num_envs, "image/reconstruction_using_hard": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+
+        rand_idx = np.random.randint(video.shape[0])
+        full_plot = rearrange(torch.tensor(video[rand_idx]).float().div(255.).permute(1, 0, 2, 3, 4), 'N L C H W -> (N L) C H W')
+        save_image(full_plot, self.media_dir / f"reconstruction_inspect_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
 
     @torch.no_grad()
     def save(self) -> None:
