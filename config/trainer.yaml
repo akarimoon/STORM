@@ -9,6 +9,7 @@ wandb:
 
 initialization:
   resume_ckpt: null
+  pretrained_ckpt: null
 
 common:
   max_steps: 102000
@@ -16,8 +17,10 @@ common:
   image_size: 64
   device: cuda:0
   resume: False
+  load_pretrained: False
 
 envs:
+  env_type: atari
   env_name: null
   num_envs: 1
 
@@ -45,13 +48,17 @@ training:
 
 world_model:
   _target_: sub_models.world_models.WorldModel
+  lr: 0.0001
+  max_grad_norm: 1000.0
   in_channels: 3
+  stem_channels: 32
   stoch_num_classes: 32
   stoch_dim: 32
   transformer_max_length: 64
   transformer_hidden_dim: 512
   transformer_num_layers: 2
   transformer_num_heads: 8
+  agent_state_type: both
 
 agent:
   _target_: agents.ActorCriticAgent

@@ -1,3 +1,5 @@
+from collections import OrderedDict
+from itertools import chain
 import math, random
 import numpy as np
 import torch
@@ -15,104 +17,67 @@ from sub_models.transformer_model import OCStochasticTransformerKVCache
 from sub_models.transformer_utils import SLATETransformerDecoder, SLATETransformerDecoderKVCache, resize_patches_to_image
 from utils import linear_warmup_exp_decay
 
+class Conv2dBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.m = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=True)
+    
+    def forward(self, x):
+        return F.relu(self.m(x))
+
+
 class EncoderBN(nn.Module):
-    def __init__(self, in_channels, stem_channels, final_feature_width) -> None:
+    def __init__(self, in_channels, stem_channels, vocab_size) -> None:
         super().__init__()
 
-        backbone = []
-        # stem
-        backbone.append(
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=stem_channels,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-                bias=False
-            )
-        )
-        feature_width = 64//2
-        channels = stem_channels
-        backbone.append(nn.BatchNorm2d(stem_channels))
-        backbone.append(nn.ReLU(inplace=True))
+        backbone = [
+            Conv2dBlock(in_channels, stem_channels, 4, 4),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+        ]
 
-        # layers
-        while True:
-            backbone.append(
-                nn.Conv2d(
-                    in_channels=channels,
-                    out_channels=channels*2,
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
-                    bias=False
-                )
-            )
-            channels *= 2
-            feature_width //= 2
-            backbone.append(nn.BatchNorm2d(channels))
-            backbone.append(nn.ReLU(inplace=True))
-
-            if feature_width == final_feature_width:
-                break
+        backbone.append(nn.Conv2d(stem_channels, vocab_size, 1))
 
         self.backbone = nn.Sequential(*backbone)
-        self.last_channels = channels
+        self.last_channels = vocab_size
 
     def forward(self, x):
         batch_size = x.shape[0]
         x = rearrange(x, "B L C H W -> (B L) C H W")
         x = self.backbone(x)
-        x = rearrange(x, "(B L) C H W -> B L (C H W)", B=batch_size)
+        x = F.log_softmax(x, dim=1)
+        x = rearrange(x, "(B L) C H W -> B L C H W", B=batch_size)
         return x
-
+    
 
 class DecoderBN(nn.Module):
-    def __init__(self, stoch_dim, last_channels, original_in_channels, stem_channels, final_feature_width) -> None:
+    def __init__(self, original_in_channels, stem_channels, vocab_size) -> None:
         super().__init__()
 
-        backbone = []
-        # stem
-        backbone.append(nn.Linear(stoch_dim, last_channels*final_feature_width*final_feature_width, bias=False))
-        backbone.append(Rearrange('B L (C H W) -> (B L) C H W', C=last_channels, H=final_feature_width))
-        backbone.append(nn.BatchNorm2d(last_channels))
-        backbone.append(nn.ReLU(inplace=True))
-        # residual_layer
-        # backbone.append(ResidualStack(last_channels, 1, last_channels//4))
-        # layers
-        channels = last_channels
-        feat_width = final_feature_width
-        while True:
-            if channels == stem_channels:
-                break
-            backbone.append(
-                nn.ConvTranspose2d(
-                    in_channels=channels,
-                    out_channels=channels//2,
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
-                    bias=False
-                )
-            )
-            channels //= 2
-            feat_width *= 2
-            backbone.append(nn.BatchNorm2d(channels))
-            backbone.append(nn.ReLU(inplace=True))
+        backbone = [
+            Conv2dBlock(vocab_size, stem_channels, 1),
+            Conv2dBlock(stem_channels, stem_channels, 3, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels * 2 * 2, 1),
+            nn.PixelShuffle(2),
+            Conv2dBlock(stem_channels, stem_channels, 3, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels, 1, 1),
+            Conv2dBlock(stem_channels, stem_channels * 2 * 2, 1),
+            nn.PixelShuffle(2),
+            nn.Conv2d(stem_channels, original_in_channels, 1),
+        ]
 
-        backbone.append(
-            nn.ConvTranspose2d(
-                in_channels=channels,
-                out_channels=original_in_channels,
-                kernel_size=4,
-                stride=2,
-                padding=1
-            )
-        )
         self.backbone = nn.Sequential(*backbone)
 
     def forward(self, sample):
         batch_size = sample.shape[0]
+        sample = rearrange(sample, "B L C H W -> (B L) C H W")
         obs_hat = self.backbone(sample)
         obs_hat = rearrange(obs_hat, "(B L) C H W -> B L C H W", B=batch_size)
         return obs_hat
@@ -212,7 +177,7 @@ class SlotAttention(nn.Module):
         return slots, dots.softmax(dim=1)
 
 
-class SpatialBroadcastMLPDecoder(nn.Module):
+class SpatialBroadcastConvDecoder(nn.Module):
     def __init__(self, dec_input_dim, dec_hidden_layers, stoch_num_classes, stoch_dim) -> None:
         super().__init__()
 
@@ -223,34 +188,33 @@ class SpatialBroadcastMLPDecoder(nn.Module):
         current_dim = dec_input_dim
     
         for dec_hidden_dim in dec_hidden_layers:
-            layers.append(nn.Linear(current_dim, dec_hidden_dim))
-            nn.init.zeros_(layers[-1].bias)
+            layers.append(nn.Conv2d(current_dim, dec_hidden_dim, 3, stride=(1, 1), padding=1))
             layers.append(nn.ReLU(inplace=True))
             current_dim = dec_hidden_dim
-
-        layers.append(nn.Linear(current_dim, stoch_dim+1))
-        nn.init.zeros_(layers[-1].bias)
+        layers.append(nn.Conv2d(current_dim, stoch_dim+1, 3, stride=(1, 1), padding=1))
         
         self.layers = nn.Sequential(*layers)
 
-        self.pos_embed = nn.Parameter(torch.randn(1, stoch_num_classes, dec_input_dim) * 0.02)
+        self.init_resolution = (16, 16)
+        self.pos_embed = PositionalEncoding2D(self.init_resolution, dec_input_dim)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # z (BL N D)
         init_shape = z.shape[:-1]
-        z = z.flatten(0, -2)
-        z = z.unsqueeze(1).expand(-1, self.stoch_num_classes, -1)
+        z = z.flatten(0, 1)
+        z = z.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.init_resolution[0], self.init_resolution[1])
 
         # Simple learned additive embedding as in ViT
-        z = z + self.pos_embed
+        z = self.pos_embed(z)
         out = self.layers(z)
-        out = out.unflatten(0, init_shape)
 
         # Split out alpha channel and normalize over slots.
-        decoded_patches, alpha = out.split([self.stoch_dim, 1], dim=-1)
+        decoded_patches, alpha = out.split([self.stoch_dim, 1], dim=-3)
         alpha = alpha.softmax(dim=-3)
+        decoded_patches = rearrange(decoded_patches, "(BL K) C H W -> BL K (H W) C", BL=init_shape[0])
+        alpha = rearrange(alpha, "(BL K) C H W -> BL K (H W) C", BL=init_shape[0])
 
-        reconstruction = torch.sum(decoded_patches * alpha, dim=-3)
+        reconstruction = torch.sum(decoded_patches * alpha, dim=1)
         masks = alpha.squeeze(-1)
         masks_as_image = resize_patches_to_image(masks, size=64, resize_mode="bilinear")
 
@@ -261,37 +225,45 @@ class DistHead(nn.Module):
     '''
     Dist: abbreviation of distribution
     '''
-    def __init__(self, image_feat_dim, transformer_hidden_dim, sbd_hidden_dim, stoch_num_classes, stoch_dim) -> None:
+    def __init__(self, transformer_hidden_dim, dec_hidden_dim, dec_num_layers, stoch_num_classes, stoch_dim) -> None:
         super().__init__()
         self.stoch_dim = stoch_dim
-        self.post_head = nn.Linear(image_feat_dim, stoch_num_classes*stoch_dim)
-        self.prior_head = SpatialBroadcastMLPDecoder(
+        self.prior_head = SpatialBroadcastConvDecoder(
             dec_input_dim=transformer_hidden_dim,
-            dec_hidden_layers=[sbd_hidden_dim, sbd_hidden_dim, sbd_hidden_dim],
+            dec_hidden_layers=[dec_hidden_dim] * dec_num_layers,
             stoch_num_classes=stoch_num_classes,
             stoch_dim=stoch_dim
         )
 
-    def unimix(self, logits, mixing_ratio=0.01):
-        # uniform noise mixing
-        probs = F.softmax(logits, dim=-1)
-        mixed_probs = mixing_ratio * torch.ones_like(probs) / self.stoch_dim + (1-mixing_ratio) * probs
-        logits = torch.log(mixed_probs)
-        return logits
+    def gumbel_softmax(self, logits, tau=1., hard=False, dim=-1):
+        eps = torch.finfo(logits.dtype).tiny
+        gumbels = -(torch.empty_like(logits).exponential_() + eps).log()
+        gumbels = (logits + gumbels) / tau
+        y_soft = F.softmax(gumbels, dim)
+        
+        if hard:
+            index = y_soft.argmax(dim, keepdim=True)
+            y_hard = torch.zeros_like(logits).scatter_(dim, index, 1.)
+            return y_hard - y_soft.detach() + y_soft
+        else:
+            return y_soft
 
-    def forward_post(self, x):
-        logits = self.post_head(x)
-        logits = rearrange(logits, "B L (K C) -> B L K C", C=self.stoch_dim)
-        logits = self.unimix(logits)
-        return logits
+    def forward_post(self, x, tau):
+        batch_size = x.shape[0]
+        x = rearrange(x, "B L C H W -> (B L) C H W")
+        logits = self.gumbel_softmax(x, tau, hard=False, dim=1)
+        hard_logits = self.gumbel_softmax(x, tau, hard=True, dim=1).detach()
+        logits = rearrange(logits, "(B L) C H W -> B L C H W", B=batch_size)
+        hard_logits = rearrange(hard_logits, "(B L) C H W -> B L (H W) C", B=batch_size) # B L K C
+        return logits, hard_logits
 
     def forward_prior(self, x):
         batch_size = x.shape[0]
         x = rearrange(x, "B L N D -> (B L) N D")
         logits, _, mask_as_image = self.prior_head(x)
         logits = rearrange(logits, "(B L) K C -> B L K C", B=batch_size)
-        logits = self.unimix(logits)
-        return logits, None, mask_as_image
+
+        return logits
 
 
 class RewardDecoder(nn.Module):
@@ -308,7 +280,7 @@ class RewardDecoder(nn.Module):
         self.head = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, feat):
-        feat = rearrange(feat, "B L K C -> B L (K C)")
+        feat = feat.sum(dim=2)
         feat = self.backbone(feat)
         reward = self.head(feat)
         return reward
@@ -331,12 +303,27 @@ class TerminationDecoder(nn.Module):
         )
 
     def forward(self, feat):
-        feat = rearrange(feat, "B L K C -> B L (K C)")
+        feat = feat.sum(dim=2)
         feat = self.backbone(feat)
         termination = self.head(feat)
         termination = termination.squeeze(-1)  # remove last 1 dim
         return termination
 
+
+class OneHotDictionary(nn.Module):
+    def __init__(self, vocab_size, emb_size):
+        super().__init__()
+        self.dictionary = nn.Embedding(vocab_size, emb_size)
+
+    def forward(self, x):
+        """
+        x: B, N, vocab_size
+        """
+
+        tokens = torch.argmax(x, dim=-1)  # batch_size x N
+        token_embs = self.dictionary(tokens)  # batch_size x N x emb_size
+        return token_embs
+    
 
 class MSELoss(nn.Module):
     def __init__(self) -> None:
@@ -345,6 +332,16 @@ class MSELoss(nn.Module):
     def forward(self, obs_hat, obs):
         loss = (obs_hat - obs)**2
         loss = reduce(loss, "B L C H W -> B L", "sum")
+        return loss.mean()
+
+
+class CELoss(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, logits_hat, logits):
+        loss = -(logits * F.log_softmax(logits_hat, dim=-1))
+        loss = reduce(loss, "B L K C -> B L", "sum")
         return loss.mean()
 
 
@@ -365,17 +362,24 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 
 class OCWorldModel(nn.Module):
-    def __init__(self, in_channels, action_dim, stoch_num_classes, stoch_dim, num_slots, slot_dim,
-                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads, sbd_hidden_dim, 
-                 lr_storm, lr_sa, max_grad_norm_storm, max_grad_norm_sa) -> None:
+    def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, num_slots, slot_dim, dec_hidden_dim, dec_num_layers, vocab_size,
+                 transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, loss_type, agent_state_type,
+                 lr_vae, lr_sa, lr_dec, lr_tf, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, max_grad_norm_tf, 
+                 lr_warmup_steps, tau_anneal_steps, coef_anneal_steps) -> None:
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
-        self.transformer_hidden_dim = transformer_hidden_dim
-        self.final_feature_width = 4
+        self.final_feature_width = 16
         self.stoch_num_classes = stoch_num_classes
         self.stoch_dim = stoch_dim
         self.stoch_flattened_dim = self.stoch_num_classes*self.stoch_dim
+        self.vocab_size = vocab_size
+        self.transformer_hidden_dim = transformer_hidden_dim
+        self.loss_type = loss_type
+        self.agent_state_type = agent_state_type
+        self.lr_warmup_steps = lr_warmup_steps
+        self.tau_anneal_steps = tau_anneal_steps
+        self.coef_anneal_steps = coef_anneal_steps
         self.use_amp = True
         self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
@@ -383,8 +387,8 @@ class OCWorldModel(nn.Module):
 
         self.encoder = EncoderBN(
             in_channels=in_channels,
-            stem_channels=32,
-            final_feature_width=self.final_feature_width
+            stem_channels=stem_channels,
+            vocab_size=vocab_size
         )
         self.slot_attn = SlotAttention(
             in_channels=self.stoch_dim,
@@ -403,135 +407,204 @@ class OCWorldModel(nn.Module):
             dropout=0.1,
         )
         self.dist_head = DistHead(
-            image_feat_dim=self.encoder.last_channels*self.final_feature_width*self.final_feature_width,
-            transformer_hidden_dim=transformer_hidden_dim,
-            sbd_hidden_dim=sbd_hidden_dim,
+            transformer_hidden_dim=slot_dim,
+            dec_hidden_dim=dec_hidden_dim,
+            dec_num_layers=dec_num_layers,
             stoch_num_classes=stoch_num_classes,
             stoch_dim=self.stoch_dim
         )
         self.image_decoder = DecoderBN(
-            stoch_dim=self.stoch_flattened_dim,
-            last_channels=self.encoder.last_channels,
             original_in_channels=in_channels,
-            stem_channels=32,
-            final_feature_width=self.final_feature_width
+            stem_channels=stem_channels,
+            vocab_size=vocab_size
         )
         self.reward_decoder = RewardDecoder(
             num_classes=255,
             embedding_size=self.stoch_flattened_dim,
-            input_dim=transformer_hidden_dim*self.num_slots,
+            input_dim=transformer_hidden_dim,
             hidden_dim=transformer_hidden_dim
         )
         self.termination_decoder = TerminationDecoder(
             embedding_size=self.stoch_flattened_dim,
-            input_dim=transformer_hidden_dim*self.num_slots,
+            input_dim=transformer_hidden_dim,
             hidden_dim=transformer_hidden_dim
         )
+        self.dict = OneHotDictionary(vocab_size, stoch_dim)
+        self.pos_embed = nn.Sequential(
+            PositionalEncoding1D(stoch_num_classes, stoch_dim, weight_init="trunc_normal"),
+            nn.Dropout(0.1)
+        )
+        self.out = nn.Linear(stoch_dim, vocab_size, bias=False)
+        if transformer_hidden_dim != slot_dim:
+            self.slot_proj = nn.Sequential(
+                nn.LayerNorm(transformer_hidden_dim),
+                nn.Linear(transformer_hidden_dim, slot_dim, bias=False)
+            )
+        else:
+            self.slot_proj = nn.Identity()
 
         self.mse_loss_func = MSELoss()
         self.ce_loss = nn.CrossEntropyLoss()
         self.bce_with_logits_loss_func = nn.BCEWithLogitsLoss()
         self.symlog_twohot_loss_func = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
         self.categorical_kl_div_loss = CategoricalKLDivLossWithFreeBits(free_bits=1)
-        
-        self.optimizer_storm = torch.optim.Adam(
-            list(self.encoder.parameters()) + list(self.storm_transformer.parameters()) + list(self.image_decoder.parameters()) + \
-            list(self.dist_head.parameters()) + list(self.reward_decoder.parameters()) + list(self.termination_decoder.parameters()),
-            lr=lr_storm
-        )
-        self.optimizer_sa = torch.optim.Adam(self.slot_attn.parameters(), lr=lr_sa)
-        self.scheduler_storm = None
-        self.scheduler_sa = torch.optim.lr_scheduler.LambdaLR(self.optimizer_sa, lr_lambda=linear_warmup_exp_decay(10000, 0.5, 100000))
-        self.max_grad_norm_storm = max_grad_norm_storm
+
+        self.optimizer_vae = torch.optim.Adam(self._get_vae_params(), lr=lr_vae)
+        self.optimizer_sa = torch.optim.Adam(self._get_sa_params(), lr=lr_sa)
+        self.optimizer_dec = torch.optim.Adam(self._get_dec_params(), lr=lr_dec)
+        self.optimizer_tf = torch.optim.Adam(self._get_tf_params(), lr=lr_tf)
+        self.scheduler_vae = None
+        self.scheduler_sa = None
+        self.scheduler_dec = None
+        self.scheduler_tf = None
+        self.max_grad_norm_vae = max_grad_norm_vae
         self.max_grad_norm_sa = max_grad_norm_sa
+        self.max_grad_norm_dec = max_grad_norm_dec
+        self.max_grad_norm_tf = max_grad_norm_tf
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-        self.agent_input_dim = self.slot_dim + self.transformer_hidden_dim
+        if agent_state_type == "latent":
+            self.agent_input_dim = self.slot_dim
+        elif agent_state_type == "hidden":
+            self.agent_input_dim = self.transformer_hidden_dim
+        else:
+            self.agent_input_dim = self.slot_dim + self.transformer_hidden_dim
+
+        self.step = 0
+
+    def _get_vae_params(self):
+        return chain(
+            self.encoder.parameters(),
+            self.image_decoder.parameters(),
+        )
+    
+    def _get_sa_params(self):
+        return chain(
+            self.slot_attn.parameters(),
+        )
+
+    def _get_dec_params(self):
+        return chain(
+            self.dist_head.parameters(),
+            self.dict.parameters(),
+            self.out.parameters(),
+            self.pos_embed.parameters(),
+        )
+
+    def _get_tf_params(self):
+        if self.transformer_hidden_dim != self.slot_dim:
+            return chain(
+                self.storm_transformer.parameters(),
+                self.slot_proj.parameters(),
+            )
+        else:
+            return chain(
+                self.storm_transformer.parameters(),
+            )
+
+    def load(self, path_to_checkpoint, device):
+        def extract_state_dict(state_dict, module_name):
+            return OrderedDict({k.split('.', 1)[1]: v for k, v in state_dict.items() if k.startswith(module_name)})
+        
+        state_dict = torch.load(path_to_checkpoint, map_location=device)
+        self.encoder.load_state_dict(extract_state_dict(state_dict, 'encoder'))
+        self.slot_attn.load_state_dict(extract_state_dict(state_dict, 'slot_attn'))
+        self.dist_head.load_state_dict(extract_state_dict(state_dict, 'dist_head'))
+        self.image_decoder.load_state_dict(extract_state_dict(state_dict, 'image_decoder'))
+        self.dict.load_state_dict(extract_state_dict(state_dict, 'dict'))
+        self.pos_embed.load_state_dict(extract_state_dict(state_dict, 'pos_embed'))
+        self.out.load_state_dict(extract_state_dict(state_dict, 'out'))
+
+        self.slot_attn._reset_slots()
 
     def encode_obs(self, obs):
+        batch_size = obs.shape[0]
+        tau = 0.1
+
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             embedding = self.encoder(obs)
-            post_logits = self.dist_head.forward_post(embedding)
-            sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
-            flattened_sample = self.flatten_sample(sample)
-        return flattened_sample
+            soft, post_logits = self.dist_head.forward_post(embedding, tau=tau)
+            post_logits = rearrange(post_logits, "B L K C -> (B L) K C")
+            sample = self.dict(post_logits)
+            sample = rearrange(sample, "(B L) K C -> B L K C", B=batch_size)
+
+        return sample
     
-    def calc_slots(self, latent, is_flat=False, return_z_emb=False):
-        batch_size, batch_length = latent.shape[:2]
-
+    def calc_slots(self, sample, return_attn=True):
+        batch_size = sample.shape[0]
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
-            if is_flat:
-                latent = rearrange(latent, "B L (K C) -> B L K C", C=self.stoch_dim)
+            sample = rearrange(sample, "B L K C -> (B L) K C")
+            sample = self.pos_embed(sample)
 
-            z_emb = rearrange(latent, "B L K C -> (B L) K C")
-            # bos = repeat(self.enc_bos, "1 1 C -> (B L) 1 C", B=batch_size, L=batch_length)
-            # z_emb = torch.cat([bos, z_emb], dim=1)
-            # z_emb = self.enc_position_encoding(z_emb)
-
-            # slot attention
-            slots, _ = self.slot_attn(z_emb)
+            slots, attns = self.slot_attn(sample)
             slots = rearrange(slots, "(B L) N D -> B L N D", B=batch_size)
 
-        if return_z_emb:
-            z_emb = rearrange(z_emb, "(B L) K C -> B L K C", B=batch_size)
-            return slots, z_emb
-
-        return slots
-
+        if not return_attn:
+            return slots
+        return slots, attns
+    
     def calc_last_dist_feat(self, latent, action):
         batch_size, batch_length = latent.shape[:2]
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
-            slots, z_emb = self.calc_slots(latent, is_flat=True, return_z_emb=True)
+            slots = self.calc_slots(latent, return_attn=False)
             temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, latent.device)
-            hidden_hat = self.storm_transformer(slots, action, temporal_mask)
-            last_hidden_hat = hidden_hat[:, -1:]
+            slots_hat = self.storm_transformer(slots, action, temporal_mask)
+            last_slots_hat = slots_hat[:, -1:]
+            last_slots_hat_ = self.slot_proj(last_slots_hat)
+            prior_logits = self.dist_head.forward_prior(last_slots_hat_)
+            prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
+            prior_logits = self.out(prior_logits)
+            prior_logits = F.one_hot(prior_logits.argmax(dim=-1), self.vocab_size).float()
+            sample = self.dict(prior_logits)
+            sample = rearrange(sample, "(B L) K C -> B L K C", B=batch_size)
+            pred_slots = self.calc_slots(sample, return_attn=False)
 
-            prior_logits, _, _ = self.dist_head.forward_prior(last_hidden_hat)
-            prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
-            prior_flattened_sample = self.flatten_sample(prior_sample)
-
-        return self.calc_slots(prior_flattened_sample, is_flat=True), last_hidden_hat
-
-    def predict_next(self, last_flattened_sample, action, log_video=True):
-        batch_size, batch_length = last_flattened_sample.shape[:2]
+        return pred_slots, last_slots_hat
+    
+    def predict_next(self, last_sample, action, log_video=True):
+        batch_size, batch_length = last_sample.shape[:2]
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
-            slots = self.calc_slots(last_flattened_sample, is_flat=True)
+            slots, attns = self.calc_slots(last_sample)
 
             hidden_hat = self.storm_transformer.forward_with_kv_cache(slots, action)
 
-            prior_logits, _, mask_as_image = self.dist_head.forward_prior(hidden_hat)
-            prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
-            prior_flattened_sample = self.flatten_sample(prior_sample)
+            hidden_hat_proj = self.slot_proj(hidden_hat)
+            prior_logits = self.dist_head.forward_prior(hidden_hat_proj)
+            prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
+            prior_logits = self.out(prior_logits)
+            prior_logits = F.one_hot(prior_logits.argmax(dim=-1), self.vocab_size).float()
+    
             if log_video:
-                obs_hat = self.image_decoder(prior_flattened_sample)
+                z = rearrange(prior_logits, "(B L) (H W) C -> B L C H W", B=batch_size, H=self.final_feature_width, W=self.final_feature_width)
+                obs_hat = self.image_decoder(z)
             else:
                 obs_hat = None
-            
+    
+            sample = self.dict(prior_logits)
+            sample = rearrange(sample, "(B L) K C -> B L K C", B=batch_size)
             reward_hat = self.reward_decoder(hidden_hat)
             reward_hat = self.symlog_twohot_loss_func.decode(reward_hat)
             termination_hat = self.termination_decoder(hidden_hat)
             termination_hat = termination_hat > 0
 
+            # visualize attn
+            H, W = obs_hat.shape[-2:]
+            attns = rearrange(attns, 'BL N (H W) -> BL N H W', H=self.final_feature_width, W=self.final_feature_width)
+            mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
             mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
-            attns = obs_hat.unsqueeze(2) * mask_as_image + 1. - mask_as_image
+            obs_hat = torch.clamp(obs_hat, 0, 1)
+            attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
 
-        return obs_hat, reward_hat, termination_hat, prior_flattened_sample, hidden_hat, attns
-
-    def stright_throught_gradient(self, logits, sample_mode="random_sample"):
-        dist = OneHotCategorical(logits=logits)
-        if sample_mode == "random_sample":
-            sample = dist.sample() + dist.probs - dist.probs.detach()
-        elif sample_mode == "mode":
-            sample = dist.mode
-        elif sample_mode == "probs":
-            sample = dist.probs
-        return sample
-
-    def flatten_sample(self, sample):
-        return rearrange(sample, "B L K C -> B L (K C)")
+        return obs_hat, reward_hat, termination_hat, sample, hidden_hat, attns
+    
+    def coef_warmup(self):
+        multiplier = 1.0
+        if self.coef_anneal_steps is not None and self.step < self.coef_anneal_steps:
+            multiplier *= self.step / self.coef_anneal_steps
+        return multiplier
 
     def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
         '''
@@ -542,7 +615,7 @@ class OCWorldModel(nn.Module):
             print(f"init_imagine_buffer: {imagine_batch_size}x{imagine_batch_length}@{dtype}")
             self.imagine_batch_size = imagine_batch_size
             self.imagine_batch_length = imagine_batch_length
-            latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
+            latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_num_classes, self.stoch_dim)
             hidden_size = (imagine_batch_size, imagine_batch_length+1, self.num_slots, self.transformer_hidden_dim)
             scalar_size = (imagine_batch_size, imagine_batch_length)
             self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
@@ -552,8 +625,7 @@ class OCWorldModel(nn.Module):
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
     def imagine_data(self, agent, sample_obs, sample_action,
-                     imagine_batch_size, imagine_batch_length, log_video=False, logger=None, gt_for_inspection=None):
-
+                     imagine_batch_size, imagine_batch_length, log_video=False, logger=None):
         self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device)
         obs_hat_list = []
         attns_list = []
@@ -562,17 +634,26 @@ class OCWorldModel(nn.Module):
         # context
         context_latent = self.encode_obs(sample_obs)
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
-            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_hidden, _ = self.predict_next(
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_hidden, last_attns = self.predict_next(
                 context_latent[:, i:i+1],
                 sample_action[:, i:i+1]
             )
+            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+            attns_list.append(last_attns[::imagine_batch_size//16])  # uniform sample vec_env
         self.latent_buffer[:, 0:1] = last_latent
         self.hidden_buffer[:, 0:1] = last_hidden
 
         # imagine
-        imagine_length = random.randint(2, imagine_batch_length) if gt_for_inspection is None else imagine_batch_length
-        for i in range(imagine_length): # from TransDreamer: at least imagine 2 steps for TD target
-            action = agent.sample(torch.cat([self.calc_slots(self.latent_buffer[:, i:i+1], is_flat=True), self.hidden_buffer[:, i:i+1]], dim=-1))
+        # imagine_length = random.randint(2, imagine_batch_length) if gt_for_inspection is None else imagine_batch_length # from TransDreamer: at least imagine 2 steps for TD target
+        imagine_length = imagine_batch_length
+        for i in range(imagine_length):
+            if self.agent_state_type == "latent":
+                state = self.calc_slots(self.latent_buffer[:, i:i+1], return_attn=False)
+            elif self.agent_state_type == "hidden":
+                state = self.hidden_buffer[:, i:i+1]
+            else:
+                state = torch.cat([self.calc_slots(self.latent_buffer[:, i:i+1], return_attn=False), self.hidden_buffer[:, i:i+1]], dim=-1)
+            action = agent.sample(state)
             self.action_buffer[:, i:i+1] = action
 
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_hidden, last_attns = self.predict_next(
@@ -582,111 +663,231 @@ class OCWorldModel(nn.Module):
 
             self.latent_buffer[:, i+1:i+2] = last_latent
             self.hidden_buffer[:, i+1:i+2] = last_hidden
+            self.latent_buffer[:, i+1:i+2] = last_latent
+            self.hidden_buffer[:, i+1:i+2] = last_hidden
             self.reward_hat_buffer[:, i:i+1] = last_reward_hat
             self.termination_hat_buffer[:, i:i+1] = last_termination_hat
             obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
-
-            # visualize attention
-            if self.final_feature_width**2 == self.stoch_num_classes:
-                attns_list.append(last_attns[::imagine_batch_size//16])  # uniform sample vec_env
-
-
-        if gt_for_inspection is not None:
-            gt_for_inspection = gt_for_inspection[::imagine_batch_size//16]
-            obs_hat_list, attns_list = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1), torch.cat(attns_list, dim=1)
-            rollout = torch.cat([gt_for_inspection.unsqueeze(2), obs_hat_list.unsqueeze(2), attns_list], dim=2).cpu().detach() # B L K C H W
-            rollout = (rollout * 255.).numpy().astype(np.uint8)
-            return rollout
+            attns_list.append(last_attns[::imagine_batch_size//16])  # uniform sample vec_env
 
         rollout = None
         if log_video:
             rollout = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).unsqueeze(2).cpu().detach() # B L K C H W
             rollout = (rollout * 255.).numpy().astype(np.uint8)
 
-        return torch.cat([self.calc_slots(self.latent_buffer, is_flat=True), self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer, rollout
+        if self.agent_state_type == "latent":
+            states = self.latent_buffer
+        elif self.agent_state_type == "hidden":
+            states = self.hidden_buffer
+        else:
+            states = torch.cat([self.calc_slots(self.latent_buffer, return_attn=False), self.hidden_buffer], dim=-1)
+
+        return states, self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer, rollout
 
     def update(self, obs, action, reward, termination, logger=None):
-        self.train()
+        freeze_dict = True
+        if freeze_dict:
+            self.train()
+            self.dict.eval()
+        else:
+            self.train()
+        
         batch_size, batch_length = obs.shape[:2]
         H, W = obs.shape[-2:]
+        tau = 0.1
+        coef_ = self.coef_warmup()
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):            
             # encoding
             embedding = self.encoder(obs)
-            post_logits = self.dist_head.forward_post(embedding)
-            sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
-            flattened_sample = self.flatten_sample(sample)
+            soft, post_logits = self.dist_head.forward_post(embedding, tau=tau)
 
             # slot attention
-            z_emb = rearrange(sample, "B L K C -> (B L) K C")
-            slots, _ = self.slot_attn(z_emb)
+            post_logits = rearrange(post_logits, "B L K C -> (B L) K C")
+            z_emb = self.dict(post_logits)
+            z_emb = self.pos_embed(z_emb)
+
+            slots, attns = self.slot_attn(z_emb)
             slots = rearrange(slots, "(B L) N D -> B L N D", B=batch_size)
             
             # decoding image
-            obs_hat = self.image_decoder(flattened_sample)
-
+            obs_hat = self.image_decoder(soft)
+            
             # transformer
-            temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, flattened_sample.device)
+            temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, soft.device)
             slots_hat = self.storm_transformer(slots, action, temporal_mask) # B L N D
             # decoding reward and termination with slots_hat
             reward_hat = self.reward_decoder(slots_hat)
             termination_hat = self.termination_decoder(slots_hat)
 
-            # slot space to logits   
-            prior_logits, _, mask_as_image = self.dist_head.forward_prior(slots_hat)
+            # slot space to logits
+            slots_hat = self.slot_proj(slots_hat)
+            prior_logits = self.dist_head.forward_prior(slots_hat)
+            prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
+            prior_logits = self.out(prior_logits)
 
             # env loss
             reconstruction_loss = self.mse_loss_func(obs_hat, obs)
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
 
-            # dyn-rep loss
-            dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
-            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
-            
-            total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
+            post_logits = rearrange(post_logits, "(B L) K C -> B L K C", B=batch_size)
+            prior_logits = rearrange(prior_logits, "(B L) K C -> B L K C", B=batch_size)
+            if self.loss_type == "slate": # ce loss
+                ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
+                total_loss = reconstruction_loss + coef_ * (ce_loss + reward_loss + termination_loss)
+            elif self.loss_type == "storm": # dyn-rep loss
+                dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
+                representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
+                total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
 
             # visualize attention
-            if self.final_feature_width**2 == self.stoch_num_classes:
-                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
-                attns = obs_hat.unsqueeze(2) * mask_as_image + 1. - mask_as_image
+            attns = rearrange(attns, 'BL N (H W) -> BL N H W', H=self.final_feature_width, W=self.final_feature_width)
+            mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
+            mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+            obs_hat = torch.clamp(obs_hat, 0, 1)
+            attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+            # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
+
+            self.step += 1
 
         # gradient descent
         self.scaler.scale(total_loss).backward()
-        self.scaler.unscale_(self.optimizer_storm)  # for clip grad
+        self.scaler.unscale_(self.optimizer_vae)  # for clip grad
         self.scaler.unscale_(self.optimizer_sa)  # for clip grad
-        torch.nn.utils.clip_grad_norm_(
-            list(self.encoder.parameters()) + list(self.storm_transformer.parameters()) + list(self.image_decoder.parameters()) + \
-            list(self.dist_head.parameters()) + list(self.reward_decoder.parameters()) + list(self.termination_decoder.parameters()), 
-            max_norm=self.max_grad_norm_storm
-        )
-        torch.nn.utils.clip_grad_norm_(self.slot_attn.parameters(), max_norm=self.max_grad_norm_sa)
-        self.scaler.step(self.optimizer_storm)
+        self.scaler.unscale_(self.optimizer_dec)  # for clip grad
+        self.scaler.unscale_(self.optimizer_tf)  # for clip grad
+        norm_vae, norm_sa, norm_dec = 0, 0, 0
+        norm_vae = torch.nn.utils.clip_grad_norm_(self._get_vae_params(), max_norm=self.max_grad_norm_vae, norm_type="inf")
+        norm_sa = torch.nn.utils.clip_grad_norm_(self._get_sa_params(), max_norm=self.max_grad_norm_sa, norm_type="inf")
+        norm_dec = torch.nn.utils.clip_grad_norm_(self._get_dec_params(), max_norm=self.max_grad_norm_dec, norm_type="inf")
+        norm_tf = torch.nn.utils.clip_grad_norm_(self._get_tf_params(), max_norm=self.max_grad_norm_tf)
+        # print(norm_vae, norm_sa, norm_dec, norm_tf)
+        self.scaler.step(self.optimizer_vae)
         self.scaler.step(self.optimizer_sa)
+        self.scaler.step(self.optimizer_dec)
+        self.scaler.step(self.optimizer_tf)
         self.scaler.update()
-        self.optimizer_storm.zero_grad(set_to_none=True)
-        self.optimizer_sa.zero_grad(set_to_none=True)
 
-        if self.scheduler_storm is not None:
-            self.scheduler_storm.step()
+        if self.scheduler_vae is not None:
+            self.scheduler_vae.step()
         if self.scheduler_sa is not None:
             self.scheduler_sa.step()
+        if self.scheduler_dec is not None:
+            self.scheduler_dec.step()
+        if self.scheduler_tf is not None:
+            self.scheduler_tf.step()
+            
+        self.optimizer_vae.zero_grad(set_to_none=True)
+        self.optimizer_sa.zero_grad(set_to_none=True)
+        self.optimizer_dec.zero_grad(set_to_none=True)
+        self.optimizer_tf.zero_grad(set_to_none=True)
 
-        if self.final_feature_width**2 == self.stoch_num_classes:
-            video = torch.cat([obs.unsqueeze(2), torch.clamp(obs_hat, 0, 1).unsqueeze(2), attns], dim=2).cpu().detach() # B L N C H W
-        else:
-            video = torch.cat([obs.unsqueeze(2), torch.clamp(obs_hat, 0, 1).unsqueeze(2)], dim=2).cpu().detach() # B L N C H W
+        video = torch.cat([obs.unsqueeze(2), obs_hat.unsqueeze(2), attns], dim=2).cpu().detach() # B L N C H W
         video = (video * 255.).numpy().astype(np.uint8)
 
         logs = {
             "world_model/reconstruction_loss": reconstruction_loss.item(),
             "world_model/reward_loss": reward_loss.item(),
             "world_model/termination_loss": termination_loss.item(),
-            "world_model/dynamics_loss": dynamics_loss.item(),
-            "world_model/dynamics_real_kl_div": dynamics_real_kl_div.item(),
-            "world_model/representation_loss": representation_loss.item(),
-            "world_model/representation_real_kl_div": representation_real_kl_div.item(),
             "world_model/total_loss": total_loss.item(),
+            "world_model/coef": coef_,
+            "world_model/lr_vae": self.optimizer_vae.param_groups[0]["lr"],
+            "world_model/lr_sa": self.optimizer_sa.param_groups[0]["lr"],
+            "world_model/lr_dec": self.optimizer_dec.param_groups[0]["lr"],
+            "world_model/lr_tf": self.optimizer_tf.param_groups[0]["lr"],
+            "world_model/norm": norm_vae + norm_sa + norm_dec + norm_tf,
         }
+        if self.loss_type == "slate":
+            logs.update({
+                "world_model/ce_loss": ce_loss.item(),
+            })
+        elif self.loss_type == "storm":
+            logs.update({
+                "world_model/dynamics_loss": dynamics_loss.item(),
+                "world_model/dynamics_real_kl_div": dynamics_real_kl_div.item(),
+                "world_model/representation_loss": representation_loss.item(),
+                "world_model/representation_real_kl_div": representation_real_kl_div.item(),
+            })
 
         return logs, video
+    
+    def inspect_reconstruction(self, obs, tau=None):
+        batch_size, batch_length = obs.shape[:2]
+        H, W = obs.shape[-2:]
+        tau = 0.1 if tau is None else tau
+
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+            # encoding
+            embedding = self.encoder(obs)
+            soft, hard = self.dist_head.forward_post(embedding, tau=tau)
+
+            # slot attention
+            hard = rearrange(hard, "B L K C -> (B L) K C")
+            z_emb = self.dict(hard)
+            z_emb = self.pos_embed(z_emb)
+            slots, attns = self.slot_attn(z_emb)
+            slots = rearrange(slots, "(B L) N D -> B L N D", B=batch_size)
+
+            # slot space to logits
+            pred_logits = self.dist_head.forward_prior(slots)
+            pred_logits = rearrange(pred_logits, "B L K C -> (B L) K C")
+            pred_logits = self.out(pred_logits)
+            pred_logits = F.one_hot(pred_logits.argmax(dim=-1), self.vocab_size).float()
+            z = rearrange(pred_logits, "(B L) (H W) C -> B L C H W", B=batch_size, H=self.final_feature_width, W=self.final_feature_width)
+            obs_hat = self.image_decoder(z)
+
+            # visualize attention
+            attns = rearrange(attns, 'B N (H W) -> B N H W', H=self.final_feature_width, W=self.final_feature_width)
+            mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
+            mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+            obs_hat = torch.clamp(obs_hat, 0, 1)
+            attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+            # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
+
+        video = torch.cat([obs.unsqueeze(2), obs_hat.unsqueeze(2), attns], dim=2).cpu().detach() # B L N C H W
+        video = (video * 255.).numpy().astype(np.uint8)
+        return video
+
+    def inspect_rollout(self, sample_obs, sample_action, gt_obs, gt_action,
+                        imagine_batch_size, imagine_batch_length, logger=None):
+        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device)
+        obs_hat_list = []
+        attns_list = []
+
+        self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=sample_obs.device)
+        # context
+        context_latent = self.encode_obs(sample_obs)
+        for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_hidden, last_attns = self.predict_next(
+                context_latent[:, i:i+1],
+                sample_action[:, i:i+1]
+            )
+            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+            attns_list.append(last_attns[::imagine_batch_size//16])  # uniform sample vec_env
+        self.latent_buffer[:, 0:1] = last_latent
+        self.hidden_buffer[:, 0:1] = last_hidden
+
+        # imagine
+        imagine_length = imagine_batch_length
+        for i in range(imagine_length):
+            self.action_buffer[:, i:i+1] = gt_action[:, i:i+1]
+
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_hidden, last_attns = self.predict_next(
+                self.latent_buffer[:, i:i+1],
+                self.action_buffer[:, i:i+1],
+            )
+
+            self.latent_buffer[:, i+1:i+2] = last_latent
+            self.hidden_buffer[:, i+1:i+2] = last_hidden
+            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+            attns_list.append(last_attns[::imagine_batch_size//16])  # uniform sample vec_env
+
+        sample_obs = sample_obs[::imagine_batch_size//16]
+        gt_obs = gt_obs[::imagine_batch_size//16]
+        obs = torch.cat([sample_obs, gt_obs], dim=1)
+        obs_hat_list = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1)
+        attns_list = torch.cat(attns_list, dim=1)
+        rollout = torch.cat([obs.unsqueeze(2), obs_hat_list.unsqueeze(2), attns_list], dim=2).cpu().detach() # B L K C H W
+        rollout = (rollout * 255.).numpy().astype(np.uint8)
+        return rollout

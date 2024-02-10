@@ -215,14 +215,16 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, in_channels, action_dim, stoch_num_classes, stoch_dim, 
-                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads):
+    def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, 
+                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads, agent_state_type,
+                 lr, max_grad_norm):
         super().__init__()
         self.transformer_hidden_dim = transformer_hidden_dim
         self.final_feature_width = 4
         self.stoch_num_classes = stoch_num_classes
         self.stoch_dim = stoch_dim
         self.stoch_flattened_dim = self.stoch_num_classes*self.stoch_dim
+        self.agent_state_type = agent_state_type
         self.use_amp = True
         self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
@@ -230,7 +232,7 @@ class WorldModel(nn.Module):
 
         self.encoder = EncoderBN(
             in_channels=in_channels,
-            stem_channels=32,
+            stem_channels=stem_channels,
             final_feature_width=self.final_feature_width
         )
         self.storm_transformer = StochasticTransformerKVCache(
@@ -252,7 +254,7 @@ class WorldModel(nn.Module):
             stoch_dim=self.stoch_flattened_dim,
             last_channels=self.encoder.last_channels,
             original_in_channels=in_channels,
-            stem_channels=32,
+            stem_channels=stem_channels,
             final_feature_width=self.final_feature_width
         )
         self.reward_decoder = RewardDecoder(
@@ -270,11 +272,17 @@ class WorldModel(nn.Module):
         self.bce_with_logits_loss_func = nn.BCEWithLogitsLoss()
         self.symlog_twohot_loss_func = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
         self.categorical_kl_div_loss = CategoricalKLDivLossWithFreeBits(free_bits=1)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        self.max_grad_norm = max_grad_norm
+
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-        self.agent_input_dim = self.stoch_flattened_dim + self.transformer_hidden_dim
-
+        if agent_state_type == "latent":
+            self.agent_input_dim = self.stoch_flattened_dim
+        elif agent_state_type == "hidden":
+            self.agent_input_dim = self.transformer_hidden_dim
+        else:
+            self.agent_input_dim = self.stoch_flattened_dim + self.transformer_hidden_dim
 
     def encode_obs(self, obs):
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
@@ -345,7 +353,7 @@ class WorldModel(nn.Module):
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
     def imagine_data(self, agent, sample_obs, sample_action,
-                     imagine_batch_size, imagine_batch_length, log_video=False, logger=None, return_rollout_as_tensor=False):
+                     imagine_batch_size, imagine_batch_length, gt_action=None, log_video=False, logger=None, return_rollout_as_tensor=False):
         self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device)
         obs_hat_list = []
 
@@ -362,7 +370,13 @@ class WorldModel(nn.Module):
 
         # imagine
         for i in range(imagine_batch_length):
-            action = agent.sample(torch.cat([self.latent_buffer[:, i:i+1], self.hidden_buffer[:, i:i+1]], dim=-1))
+            if self.agent_state_type == "latent":
+                state = agent.sample(self.latent_buffer[:, i:i+1])
+            elif self.agent_state_type == "hidden":
+                state = agent.sample(self.hidden_buffer[:, i:i+1])
+            else:
+                state = torch.cat([self.latent_buffer[:, i:i+1], self.hidden_buffer[:, i:i+1]], dim=-1)
+            action = agent.sample(state)
             self.action_buffer[:, i:i+1] = action
 
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
@@ -382,7 +396,14 @@ class WorldModel(nn.Module):
         if not return_rollout_as_tensor:
             rollout = (rollout * 255.).numpy().astype(np.uint8)
 
-        return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer, rollout
+        if self.agent_state_type == "latent":
+            states = self.latent_buffer
+        elif self.agent_state_type == "hidden":
+            states = self.hidden_buffer
+        else:
+            states = torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1)
+
+        return states, self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer, rollout
 
     def update(self, obs, action, reward, termination, logger=None):
         self.train()
@@ -418,7 +439,7 @@ class WorldModel(nn.Module):
         # gradient descent
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1000.0)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
@@ -438,3 +459,53 @@ class WorldModel(nn.Module):
         }
 
         return logs, video
+    
+    def inspect_reconstruction(self, obs):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+            embedding = self.encoder(obs)
+            post_logits = self.dist_head.forward_post(embedding)
+            sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+            flattened_sample = self.flatten_sample(sample)
+            obs_hat = self.image_decoder(flattened_sample)
+        video = torch.cat([obs.unsqueeze(2), torch.clamp(obs_hat, 0, 1).unsqueeze(2)], dim=2).cpu().detach() # B T K C H W
+        video = (video * 255.).numpy().astype(np.uint8)
+        return video
+
+    def inspect_rollout(self, sample_obs, sample_action, gt_obs, gt_action,
+                        imagine_batch_size, imagine_batch_length, logger=None):
+        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device)
+        obs_hat_list = []
+
+        self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=sample_obs.device)
+        # context
+        context_latent = self.encode_obs(sample_obs)
+        for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
+                context_latent[:, i:i+1],
+                sample_action[:, i:i+1],
+            )
+        self.latent_buffer[:, 0:1] = last_latent
+        self.hidden_buffer[:, 0:1] = last_dist_feat
+
+        # imagine
+        for i in range(imagine_batch_length):
+            action = gt_action[:, i:i+1]
+            self.action_buffer[:, i:i+1] = action
+
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
+                self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1])
+
+            self.latent_buffer[:, i+1:i+2] = last_latent
+            self.hidden_buffer[:, i+1:i+2] = last_dist_feat
+            self.reward_hat_buffer[:, i:i+1] = last_reward_hat
+            self.termination_hat_buffer[:, i:i+1] = last_termination_hat
+            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+
+        sample_obs = sample_obs[::imagine_batch_size//16]
+        gt_obs = gt_obs[::imagine_batch_size//16]
+        obs = torch.cat([sample_obs, gt_obs], dim=1)
+        obs_hat = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1)
+        video = torch.cat([obs.unsqueeze(2), obs_hat.unsqueeze(2)], dim=2).cpu().detach() # B T K C H W
+        video = (video * 255.).numpy().astype(np.uint8)
+
+        return video

@@ -93,6 +93,11 @@ class Trainer:
         self.world_model = instantiate(cfg.world_model, action_dim=action_dim).to(self.device)
         self.agent = instantiate(cfg.agent, action_dim=action_dim, feat_dim=self.world_model.agent_input_dim).to(self.device)
         
+        if cfg.common.load_pretrained:
+            path_to_checkpoint = Path(hydra.utils.get_original_cwd()) / "pretrained" / cfg.initialization.pretrained_ckpt
+            print(colorama.Fore.MAGENTA + f"loading pretrained model from {path_to_checkpoint}" + colorama.Style.RESET_ALL)
+            self.world_model.load(path_to_checkpoint, self.device)
+
         # build replay buffer
         self.replay_buffer = instantiate(cfg.replay_buffer, obs_shape=(cfg.common.image_size, cfg.common.image_size, 3), num_envs=cfg.envs.num_envs, device=self.device)
 
@@ -136,7 +141,8 @@ class Trainer:
                 if self.total_steps % (self.cfg.training.save_every_steps//self.num_envs) == 0:
                     self.save()
 
-                if self.total_steps % (self.cfg.training.vis_every_steps//self.num_envs) == 0:
+                if self.total_steps % (self.cfg.training.inspect_every_steps//self.num_envs) == 0:
+                    self.inspect_reconstruction()
                     self.inspect_world_model()
 
             self.total_steps += 1
@@ -155,8 +161,14 @@ class Trainer:
                 model_context_action = np.stack(list(context_action), axis=1)
                 model_context_action = torch.Tensor(model_context_action).to(self.device)
                 prior_flattened_sample, last_dist_feat = self.world_model.calc_last_dist_feat(context_latent, model_context_action)
+                if self.world_model.agent_state_type == "latent":
+                    state = prior_flattened_sample
+                elif self.world_model.agent_state_type == "hidden":
+                    state = last_dist_feat
+                else:
+                    state = torch.cat([prior_flattened_sample, last_dist_feat], dim=-1)
                 action = self.agent.sample_as_env_action(
-                    torch.cat([prior_flattened_sample, last_dist_feat], dim=-1),
+                    state,
                     greedy=False
                 )
 
@@ -250,6 +262,20 @@ class Trainer:
             save_image(full_plot, self.media_dir / f"rollout_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
 
     @torch.no_grad()
+    def inspect_reconstruction(self) -> None:
+        self.world_model.eval()
+        with torch.no_grad():
+            sample_obs, sample_action, sample_reward, sample_termination = self.replay_buffer.sample(
+                self.cfg.training.imagine_batch_size, self.cfg.training.imagine_demonstration_batch_size, self.cfg.training.imagine_context_length)
+            video = self.world_model.inspect_reconstruction(sample_obs, tau=0.1)
+
+        wandb.log({"step": self.total_steps//self.num_envs, "video/reconstruction_using_hard": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+
+        rand_idx = np.random.randint(video.shape[0])
+        full_plot = rearrange(torch.tensor(video[rand_idx]).float().div(255.).permute(1, 0, 2, 3, 4), 'N L C H W -> (N L) C H W')
+        save_image(full_plot, self.media_dir / f"reconstruction_inspect_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
+
+    @torch.no_grad()
     def inspect_world_model(self) -> None:
         self.world_model.eval()
         self.agent.eval()
@@ -258,13 +284,12 @@ class Trainer:
             sample_obs, sample_action, sample_reward, sample_termination = self.replay_buffer.sample(
                 self.cfg.training.imagine_batch_size, self.cfg.training.imagine_demonstration_batch_size, self.cfg.training.imagine_context_length+self.cfg.training.imagine_batch_length)
             context_obs, context_action = sample_obs[:, :self.cfg.training.imagine_context_length], sample_action[:, :self.cfg.training.imagine_context_length]
-            gt_obs = sample_obs[:, self.cfg.training.imagine_context_length:]
-            video = self.world_model.imagine_data(
-                self.agent, context_obs, context_action,
+            gt_obs, gt_action = sample_obs[:, self.cfg.training.imagine_context_length:], sample_action[:, self.cfg.training.imagine_context_length:]
+            video = self.world_model.inspect_rollout(
+                context_obs, context_action, gt_obs, gt_action,
                 imagine_batch_size=self.cfg.training.imagine_batch_size+self.cfg.training.imagine_demonstration_batch_size,
                 imagine_batch_length=self.cfg.training.imagine_batch_length,
                 log_video=True,
-                gt_for_inspection=gt_obs,
             )
 
         if video.shape[2] >= 3:
