@@ -334,13 +334,14 @@ class WorldModel(nn.Module):
     def flatten_sample(self, sample):
         return rearrange(sample, "B L K C -> B L (K C)")
 
-    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
+    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device, silent=False):
         '''
         This can slightly improve the efficiency of imagine_data
         But may vary across different machines
         '''
         if self.imagine_batch_size != imagine_batch_size or self.imagine_batch_length != imagine_batch_length:
-            print(f"init_imagine_buffer: {imagine_batch_size}x{imagine_batch_length}@{dtype}")
+            if not silent:
+                print(f"init_imagine_buffer: {imagine_batch_size}x{imagine_batch_length}@{dtype}")
             self.imagine_batch_size = imagine_batch_size
             self.imagine_batch_length = imagine_batch_length
             latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
@@ -439,7 +440,7 @@ class WorldModel(nn.Module):
         # gradient descent
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
+        norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
@@ -456,6 +457,7 @@ class WorldModel(nn.Module):
             "world_model/representation_loss": representation_loss.item(),
             "world_model/representation_real_kl_div": representation_real_kl_div.item(),
             "world_model/total_loss": total_loss.item(),
+            "world_model/norm": norm.item(),
         }
 
         return logs, video
@@ -473,7 +475,7 @@ class WorldModel(nn.Module):
 
     def inspect_rollout(self, sample_obs, sample_action, gt_obs, gt_action,
                         imagine_batch_size, imagine_batch_length, logger=None):
-        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device)
+        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device, silent=True)
         obs_hat_list = []
 
         self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=sample_obs.device)
@@ -484,6 +486,7 @@ class WorldModel(nn.Module):
                 context_latent[:, i:i+1],
                 sample_action[:, i:i+1],
             )
+            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
         self.latent_buffer[:, 0:1] = last_latent
         self.hidden_buffer[:, 0:1] = last_dist_feat
 
