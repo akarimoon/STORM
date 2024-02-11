@@ -47,7 +47,7 @@ def build_vec_env(env_name, env_type, image_size, num_envs, seed, max_step=1000)
         if env_type == "atari":
             return lambda: build_single_atari_env(env_name, image_size, seed)
         elif env_type == "ocrl":
-            return lambda: build_single_ocrl_env(env_name, image_size, seed, max_step=1000)
+            return lambda: build_single_ocrl_env(env_name, image_size, seed, max_step=max_step)
     env_fns = []
     env_fns = [lambda_generator(env_name, image_size) for i in range(num_envs)]
     vec_env = gymnasium.vector.AsyncVectorEnv(env_fns=env_fns)

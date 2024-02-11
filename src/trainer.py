@@ -44,7 +44,7 @@ def build_vec_env(env_name, env_type, image_size, num_envs, seed, max_step=1000)
         if env_type == "atari":
             return lambda: build_single_atari_env(env_name, image_size, seed)
         elif env_type == "ocrl":
-            return lambda: build_single_ocrl_env(env_name, image_size, seed, max_step=1000)
+            return lambda: build_single_ocrl_env(env_name, image_size, seed, max_step=max_step)
     env_fns = []
     env_fns = [lambda_generator(env_name, image_size) for i in range(num_envs)]
     vec_env = gymnasium.vector.AsyncVectorEnv(env_fns=env_fns)
@@ -194,6 +194,11 @@ class Trainer:
                         "replay_buffer/length": len(self.replay_buffer),
                     })
                     sum_reward[i] = 0
+                    if self.cfg.envs.env_type == "ocrl":
+                        self.replay_buffer.end_episode()
+                        current_obs, current_info = self.vec_env.reset()
+                        context_obs = deque(maxlen=16)
+                        context_action = deque(maxlen=16)
 
         # update current_obs, current_info and sum_reward
         sum_reward += reward
@@ -282,14 +287,13 @@ class Trainer:
 
         with torch.no_grad():
             sample_obs, sample_action, sample_reward, sample_termination = self.replay_buffer.sample(
-                self.cfg.training.imagine_batch_size, self.cfg.training.imagine_demonstration_batch_size, self.cfg.training.imagine_context_length+self.cfg.training.imagine_batch_length)
-            context_obs, context_action = sample_obs[:, :self.cfg.training.imagine_context_length], sample_action[:, :self.cfg.training.imagine_context_length]
-            gt_obs, gt_action = sample_obs[:, self.cfg.training.imagine_context_length:], sample_action[:, self.cfg.training.imagine_context_length:]
+                self.cfg.training.inspect_batch_size, 0, self.cfg.training.inspect_context_length+self.cfg.training.inspect_batch_length)
+            context_obs, context_action = sample_obs[:, :self.cfg.training.inspect_context_length], sample_action[:, :self.cfg.training.inspect_context_length]
+            gt_obs, gt_action = sample_obs[:, self.cfg.training.inspect_context_length:], sample_action[:, self.cfg.training.inspect_context_length:]
             video = self.world_model.inspect_rollout(
                 context_obs, context_action, gt_obs, gt_action,
-                imagine_batch_size=self.cfg.training.imagine_batch_size+self.cfg.training.imagine_demonstration_batch_size,
-                imagine_batch_length=self.cfg.training.imagine_batch_length,
-                log_video=True,
+                imagine_batch_size=self.cfg.training.inspect_batch_size,
+                imagine_batch_length=self.cfg.training.inspect_batch_length,
             )
 
         if video.shape[2] >= 3:

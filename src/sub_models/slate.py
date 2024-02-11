@@ -862,7 +862,7 @@ class SLATEWorldModel(SLATE):
             norm_sa = torch.nn.utils.clip_grad_norm_(self._get_sa_params(), max_norm=self.max_grad_norm_sa, norm_type="inf")
             norm_dec = torch.nn.utils.clip_grad_norm_(self._get_dec_params(), max_norm=self.max_grad_norm_vae, norm_type="inf")
         norm_tf = torch.nn.utils.clip_grad_norm_(self._get_tf_params(), max_norm=self.max_grad_norm_tf)
-        print(norm_vae, norm_sa, norm_dec, norm_tf)
+        # print(norm_vae, norm_sa, norm_dec, norm_tf)
         if not train_only_tf:
             self.scaler.step(self.optimizer_vae)
             self.scaler.step(self.optimizer_sa)
