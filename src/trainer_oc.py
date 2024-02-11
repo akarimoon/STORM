@@ -145,6 +145,8 @@ class Trainer:
                     self.inspect_reconstruction()
                     self.inspect_world_model()
 
+                    self.eval()
+
             self.total_steps += 1
 
     @torch.no_grad()
@@ -266,6 +268,45 @@ class Trainer:
             save_image(full_plot, self.media_dir / f"rollout_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
 
     @torch.no_grad()
+    def eval(self) -> None:
+        self.world_model.eval()
+        self.agent.eval()
+
+        self.test_env = build_vec_env(self.cfg.env_config, self.cfg.envs.env_type, self.cfg.common.image_size, num_envs=self.num_envs,
+                                        seed=self.cfg.common.seed, max_step=self.cfg.evaluation.max_step)
+        
+        all_rewards = []
+        for _ in range(self.cfg.evaluation.num_episodes):
+            current_obs, info = self.test_env.reset()
+            context_obs = deque(maxlen=16)
+            context_action = deque(maxlen=16)
+            context_obs.append(rearrange(torch.Tensor(current_obs).to(self.device), "B H W C -> B 1 C H W")/255)
+            context_action.append(self.test_env.action_space.sample())
+
+            done = False
+            rewards = 0
+            while not done:
+                context_latent = self.world_model.encode_obs(torch.cat(list(context_obs), dim=1))
+                model_context_action = np.stack(list(context_action), axis=1)
+                model_context_action = torch.Tensor(model_context_action).to(self.device)
+                prior_flattened_sample, last_dist_feat = self.world_model.calc_last_dist_feat(context_latent, model_context_action)
+                if self.world_model.agent_state_type == "latent":
+                    state = prior_flattened_sample
+                elif self.world_model.agent_state_type == "hidden":
+                    state = last_dist_feat
+                else:
+                    state = torch.cat([prior_flattened_sample, last_dist_feat], dim=-1)
+                action = self.agent.sample_as_env_action(state, greedy=False)
+                
+                current_obs, reward, done, truncated, info = self.test_env.step(action)
+                context_obs.append(rearrange(torch.Tensor(current_obs).to(self.device), "B H W C -> B 1 C H W")/255)
+                context_action.append(action)
+
+                rewards += reward
+            all_rewards.append(rewards)
+        wandb.log({"step": self.total_steps//self.num_envs, "eval/mean_reward": np.mean(all_rewards), "eval/std_reward": np.std(all_rewards)})
+
+    @torch.no_grad()
     def inspect_reconstruction(self) -> None:
         self.world_model.eval()
         with torch.no_grad():
@@ -273,7 +314,8 @@ class Trainer:
                 self.cfg.training.imagine_batch_size, self.cfg.training.imagine_demonstration_batch_size, self.cfg.training.imagine_context_length)
             video = self.world_model.inspect_reconstruction(sample_obs, tau=0.1)
 
-        wandb.log({"step": self.total_steps//self.num_envs, "video/reconstruction_using_hard": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+        if video.shape[2] >= 3:
+            wandb.log({"step": self.total_steps//self.num_envs, "video/reconstruction_using_hard": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
 
         rand_idx = np.random.randint(video.shape[0])
         full_plot = rearrange(torch.tensor(video[rand_idx]).float().div(255.).permute(1, 0, 2, 3, 4), 'N L C H W -> (N L) C H W')
@@ -293,7 +335,6 @@ class Trainer:
                 context_obs, context_action, gt_obs, gt_action,
                 imagine_batch_size=self.cfg.training.inspect_batch_size,
                 imagine_batch_length=self.cfg.training.inspect_batch_length,
-                log_video=True,
             )
 
         if video.shape[2] >= 3:
