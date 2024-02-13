@@ -40,7 +40,7 @@ training:
   batch_size: 16
   demonstration_batch_size: 0
   batch_length: 8
-  imagine_batch_size: 128 # 1024
+  imagine_batch_size: 1024
   imagine_demonstration_batch_size: 0
   imagine_context_length: 4
   imagine_batch_length: 20
@@ -55,6 +55,10 @@ training:
   inspect_batch_size: 16
   inspect_context_length: 4
   inspect_batch_length: 8
+
+evaluation:
+  max_step: 2048
+  num_episodes: 100
 
 world_model:
   _target_: sub_models.world_models.WorldModel
@@ -77,3 +81,5 @@ agent:
   gamma: 0.985
   lambd: 0.95
   entropy_coef: 3.0e-4
+  lr: 3.0e-5
+  max_grad_norm: 100.0

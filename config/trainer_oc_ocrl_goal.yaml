@@ -41,7 +41,7 @@ training:
   batch_size: 16
   demonstration_batch_size: 0
   batch_length: 8
-  imagine_batch_size: 128 # 1024
+  imagine_batch_size: 32 # 1024
   imagine_demonstration_batch_size: 0
   imagine_context_length: 4
   imagine_batch_length: 20
@@ -57,16 +57,22 @@ training:
   inspect_context_length: 4
   inspect_batch_length: 8
 
+evaluation:
+  max_step: 2048
+  num_episodes: 100
+
 world_model:
   _target_: sub_models.oc_world_models.OCWorldModel
   lr_vae: 0.0003
   lr_sa: 0.0001
   lr_dec: 0.0001
   lr_tf: 0.0001
+  lr_rt: 0.0001
   max_grad_norm_vae: 0.05 
   max_grad_norm_sa: 0.05
   max_grad_norm_dec: 0.05
   max_grad_norm_tf: 1000.0
+  max_grad_norm_rt: 1000.0
   in_channels: 3
   stem_channels: 64
   stoch_num_classes: 256
@@ -85,12 +91,16 @@ world_model:
   lr_warmup_steps: -1
   tau_anneal_steps: -1
   coef_anneal_steps: 15000
+  vis_attn_type: sa
 
 agent:
   _target_: agents.OCActorCriticAgent
   num_heads: 8
   num_layers: 1
   hidden_dim: 128
+  mlp_hidden_dim: 64
   gamma: 0.985
   lambd: 0.95
   entropy_coef: 3.0e-4
+  lr: 5.0e-5
+  max_grad_norm: 0.05
