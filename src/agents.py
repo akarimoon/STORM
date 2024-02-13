@@ -8,8 +8,7 @@ import copy
 from torch.cuda.amp import autocast
 
 from sub_models.functions_losses import SymLogTwoHotLoss
-from utils import EMAScalar
-
+from utils import EMAScalar, linear_warmup_exp_decay
 
 def percentile(x, percentage):
     flat_x = torch.flatten(x)
@@ -35,11 +34,13 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
 
 
 class ActorCriticAgent(nn.Module):
-    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
+    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef,
+                 lr, max_grad_norm) -> None:
         super().__init__()
         self.gamma = gamma
         self.lambd = lambd
         self.entropy_coef = entropy_coef
+        self.max_grad_norm = max_grad_norm
         self.use_amp = True
         self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
 
@@ -82,7 +83,8 @@ class ActorCriticAgent(nn.Module):
         self.lowerbound_ema = EMAScalar(decay=0.99)
         self.upperbound_ema = EMAScalar(decay=0.99)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=3e-5, eps=1e-5)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
+        self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     @torch.no_grad()
@@ -161,9 +163,14 @@ class ActorCriticAgent(nn.Module):
         # gradient descent
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=100.0)
+        norm_ac = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
+        # print(norm_ac)
         self.scaler.step(self.optimizer)
         self.scaler.update()
+
+        if self.scheduler is not None:
+            self.scheduler.step()
+
         self.optimizer.zero_grad(set_to_none=True)
 
         self.update_slow_critic()
@@ -174,7 +181,8 @@ class ActorCriticAgent(nn.Module):
             'actor_critic/entropy_loss': entropy_loss.item(),
             'actor_critic/raw_norm_ratio': S.item(),
             'actor_critic/norm_ratio': norm_ratio.item(),
-            'actor_critic/total_loss': loss.item()
+            'actor_critic/total_loss': loss.item(),
+            'actor_critic/norm_ac': norm_ac.item()
         }
         return logs
 
@@ -204,21 +212,54 @@ class TransformerWithCLS(nn.Module):
         feats = rearrange(feats, "(B L) D -> B L D", B=B)
 
         return feats
+    
+
+class MLP(nn.Module):
+    def __init__(self, in_features, d_model):
+        super(MLP, self).__init__()
+        self._linear = nn.Sequential(
+            nn.Linear(in_features, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        B, L = state.shape[:2]
+        state = rearrange(state, "B L N D -> (B L) N D")
+        state = state.sum(dim=1)
+
+        feats = self._linear(state)
+        feats = rearrange(feats, "(B L) D -> B L D", B=B)
+
+        return feats
 
 
 class OCActorCriticAgent(ActorCriticAgent):
-    def __init__(self, feat_dim, num_heads, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
-        super().__init__(feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef)
+    def __init__(self, feat_dim, num_heads, num_layers, hidden_dim, mlp_hidden_dim, action_dim, gamma, lambd, entropy_coef,
+                 lr, max_grad_norm) -> None:
+        super().__init__(feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, lr, max_grad_norm)
 
-        actor = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
+        # shared_transformer = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
+        shared_transformer = MLP(feat_dim, hidden_dim)
+        # shared_mlp = nn.Sequential(
+        #     nn.Linear(hidden_dim, mlp_hidden_dim),
+        #     nn.LayerNorm(mlp_hidden_dim),
+        #     nn.ReLU(inplace=True),
+        #     nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
+        #     nn.LayerNorm(mlp_hidden_dim),
+        #     nn.ReLU(inplace=True)
+        # )
         self.actor = nn.Sequential(
-            actor,
+            shared_transformer,
+            # shared_mlp,
             nn.Linear(hidden_dim, action_dim)
         )
-
-        critic = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
         self.critic = nn.Sequential(
-            critic,
+            shared_transformer,
+            # shared_mlp,
             nn.Linear(hidden_dim, 255)
         )
 
@@ -227,5 +268,8 @@ class OCActorCriticAgent(ActorCriticAgent):
         self.lowerbound_ema = EMAScalar(decay=0.99)
         self.upperbound_ema = EMAScalar(decay=0.99)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=3e-5, eps=1e-5)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.max_grad_norm, eps=1e-5)
+        self.scheduler = None
+        # self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=linear_warmup_exp_decay(15000))
+
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
