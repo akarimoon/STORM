@@ -263,7 +263,7 @@ class DistHead(nn.Module):
         logits, _, mask_as_image = self.prior_head(x)
         logits = rearrange(logits, "(B L) K C -> B L K C", B=batch_size)
 
-        return logits
+        return logits, _, mask_as_image
 
 
 class RewardDecoder(nn.Module):
@@ -280,7 +280,7 @@ class RewardDecoder(nn.Module):
         self.head = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, feat):
-        feat = feat.sum(dim=2)
+        feat = feat.sum(dim=-2)
         feat = self.backbone(feat)
         reward = self.head(feat)
         return reward
@@ -303,7 +303,7 @@ class TerminationDecoder(nn.Module):
         )
 
     def forward(self, feat):
-        feat = feat.sum(dim=2)
+        feat = feat.sum(dim=-2)
         feat = self.backbone(feat)
         termination = self.head(feat)
         termination = termination.squeeze(-1)  # remove last 1 dim
@@ -364,8 +364,8 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 class OCWorldModel(nn.Module):
     def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, num_slots, slot_dim, dec_hidden_dim, dec_num_layers, vocab_size,
                  transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, loss_type, agent_state_type,
-                 lr_vae, lr_sa, lr_dec, lr_tf, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, max_grad_norm_tf, 
-                 lr_warmup_steps, tau_anneal_steps, coef_anneal_steps) -> None:
+                 lr_vae, lr_sa, lr_dec, lr_tf, lr_rt, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, max_grad_norm_tf, max_grad_norm_rt,
+                 lr_warmup_steps, tau_anneal_steps, coef_anneal_steps, vis_attn_type) -> None:
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -380,6 +380,7 @@ class OCWorldModel(nn.Module):
         self.lr_warmup_steps = lr_warmup_steps
         self.tau_anneal_steps = tau_anneal_steps
         self.coef_anneal_steps = coef_anneal_steps
+        self.vis_attn_type = vis_attn_type
         self.use_amp = True
         self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
@@ -444,7 +445,7 @@ class OCWorldModel(nn.Module):
             self.slot_proj = nn.Identity()
 
         self.mse_loss_func = MSELoss()
-        self.ce_loss = nn.CrossEntropyLoss()
+        self.ce_loss = CELoss()
         self.bce_with_logits_loss_func = nn.BCEWithLogitsLoss()
         self.symlog_twohot_loss_func = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
         self.categorical_kl_div_loss = CategoricalKLDivLossWithFreeBits(free_bits=1)
@@ -453,14 +454,18 @@ class OCWorldModel(nn.Module):
         self.optimizer_sa = torch.optim.Adam(self._get_sa_params(), lr=lr_sa)
         self.optimizer_dec = torch.optim.Adam(self._get_dec_params(), lr=lr_dec)
         self.optimizer_tf = torch.optim.Adam(self._get_tf_params(), lr=lr_tf)
+        self.optimizer_rt = torch.optim.Adam(self._get_rt_params(), lr=lr_rt)
         self.scheduler_vae = None
         self.scheduler_sa = None
         self.scheduler_dec = None
         self.scheduler_tf = None
+        self.scheduler_rt = None
+        # self.scheduler_rt = torch.optim.lr_scheduler.LambdaLR(self.optimizer_rt, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps))
         self.max_grad_norm_vae = max_grad_norm_vae
         self.max_grad_norm_sa = max_grad_norm_sa
         self.max_grad_norm_dec = max_grad_norm_dec
         self.max_grad_norm_tf = max_grad_norm_tf
+        self.max_grad_norm_rt = max_grad_norm_rt
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
@@ -502,6 +507,12 @@ class OCWorldModel(nn.Module):
             return chain(
                 self.storm_transformer.parameters(),
             )
+        
+    def _get_rt_params(self):
+        return chain(
+            self.reward_decoder.parameters(),
+            self.termination_decoder.parameters(),
+        )
 
     def load(self, path_to_checkpoint, device):
         def extract_state_dict(state_dict, module_name):
@@ -516,7 +527,7 @@ class OCWorldModel(nn.Module):
         self.pos_embed.load_state_dict(extract_state_dict(state_dict, 'pos_embed'))
         self.out.load_state_dict(extract_state_dict(state_dict, 'out'))
 
-        self.slot_attn._reset_slots()
+        # self.slot_attn._reset_slots()
 
     def encode_obs(self, obs):
         batch_size = obs.shape[0]
@@ -553,7 +564,7 @@ class OCWorldModel(nn.Module):
             slots_hat = self.storm_transformer(slots, action, temporal_mask)
             last_slots_hat = slots_hat[:, -1:]
             last_slots_hat_ = self.slot_proj(last_slots_hat)
-            prior_logits = self.dist_head.forward_prior(last_slots_hat_)
+            prior_logits, _, mask_as_image = self.dist_head.forward_prior(last_slots_hat_)
             prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
             prior_logits = self.out(prior_logits)
             prior_logits = F.one_hot(prior_logits.argmax(dim=-1), self.vocab_size).float()
@@ -572,7 +583,7 @@ class OCWorldModel(nn.Module):
             hidden_hat = self.storm_transformer.forward_with_kv_cache(slots, action)
 
             hidden_hat_proj = self.slot_proj(hidden_hat)
-            prior_logits = self.dist_head.forward_prior(hidden_hat_proj)
+            prior_logits, _, mask_as_image = self.dist_head.forward_prior(hidden_hat_proj)
             prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
             prior_logits = self.out(prior_logits)
             prior_logits = F.one_hot(prior_logits.argmax(dim=-1), self.vocab_size).float()
@@ -592,27 +603,35 @@ class OCWorldModel(nn.Module):
 
             # visualize attn
             H, W = obs_hat.shape[-2:]
-            attns = rearrange(attns, 'BL N (H W) -> BL N H W', H=self.final_feature_width, W=self.final_feature_width)
-            mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
-            mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
-            obs_hat = torch.clamp(obs_hat, 0, 1)
-            attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+            if self.vis_attn_type == "sbd":
+                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+                obs_hat = torch.clamp(obs_hat, 0, 1)
+                attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+                # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
+            elif self.vis_attn_type == "sa":
+                attns = rearrange(attns, 'B N (H W) -> B N H W', H=self.final_feature_width, W=self.final_feature_width)
+                mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
+                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+                obs_hat = torch.clamp(obs_hat, 0, 1)
+                attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+                # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
 
         return obs_hat, reward_hat, termination_hat, sample, hidden_hat, attns
     
-    def coef_warmup(self):
+    def coef_warmup(self, steps):
         multiplier = 1.0
-        if self.coef_anneal_steps is not None and self.step < self.coef_anneal_steps:
-            multiplier *= self.step / self.coef_anneal_steps
+        if steps is not None and self.step < steps:
+            multiplier *= self.step / steps
         return multiplier
 
-    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
+    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device, silent=False):
         '''
         This can slightly improve the efficiency of imagine_data
         But may vary across different machines
         '''
         if self.imagine_batch_size != imagine_batch_size or self.imagine_batch_length != imagine_batch_length:
-            print(f"init_imagine_buffer: {imagine_batch_size}x{imagine_batch_length}@{dtype}")
+            if not silent:
+                print(f"init_imagine_buffer: {imagine_batch_size}x{imagine_batch_length}@{dtype}")
             self.imagine_batch_size = imagine_batch_size
             self.imagine_batch_length = imagine_batch_length
             latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_num_classes, self.stoch_dim)
@@ -663,8 +682,6 @@ class OCWorldModel(nn.Module):
 
             self.latent_buffer[:, i+1:i+2] = last_latent
             self.hidden_buffer[:, i+1:i+2] = last_hidden
-            self.latent_buffer[:, i+1:i+2] = last_latent
-            self.hidden_buffer[:, i+1:i+2] = last_hidden
             self.reward_hat_buffer[:, i:i+1] = last_reward_hat
             self.termination_hat_buffer[:, i:i+1] = last_termination_hat
             obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
@@ -695,7 +712,7 @@ class OCWorldModel(nn.Module):
         batch_size, batch_length = obs.shape[:2]
         H, W = obs.shape[-2:]
         tau = 0.1
-        coef_ = self.coef_warmup()
+        coef_ = self.coef_warmup(self.coef_anneal_steps)
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):            
             # encoding
@@ -722,7 +739,7 @@ class OCWorldModel(nn.Module):
 
             # slot space to logits
             slots_hat = self.slot_proj(slots_hat)
-            prior_logits = self.dist_head.forward_prior(slots_hat)
+            prior_logits, _, mask_as_image = self.dist_head.forward_prior(slots_hat)
             prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
             prior_logits = self.out(prior_logits)
 
@@ -742,12 +759,18 @@ class OCWorldModel(nn.Module):
                 total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
 
             # visualize attention
-            attns = rearrange(attns, 'BL N (H W) -> BL N H W', H=self.final_feature_width, W=self.final_feature_width)
-            mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
-            mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
-            obs_hat = torch.clamp(obs_hat, 0, 1)
-            attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
-            # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
+            if self.vis_attn_type == "sbd":
+                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+                obs_hat = torch.clamp(obs_hat, 0, 1)
+                attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+                # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
+            elif self.vis_attn_type == "sa":
+                attns = rearrange(attns, 'B N (H W) -> B N H W', H=self.final_feature_width, W=self.final_feature_width)
+                mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
+                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+                obs_hat = torch.clamp(obs_hat, 0, 1)
+                attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+                # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
 
             self.step += 1
 
@@ -757,16 +780,18 @@ class OCWorldModel(nn.Module):
         self.scaler.unscale_(self.optimizer_sa)  # for clip grad
         self.scaler.unscale_(self.optimizer_dec)  # for clip grad
         self.scaler.unscale_(self.optimizer_tf)  # for clip grad
-        norm_vae, norm_sa, norm_dec = 0, 0, 0
+        self.scaler.unscale_(self.optimizer_rt)  # for clip grad
         norm_vae = torch.nn.utils.clip_grad_norm_(self._get_vae_params(), max_norm=self.max_grad_norm_vae, norm_type="inf")
         norm_sa = torch.nn.utils.clip_grad_norm_(self._get_sa_params(), max_norm=self.max_grad_norm_sa, norm_type="inf")
         norm_dec = torch.nn.utils.clip_grad_norm_(self._get_dec_params(), max_norm=self.max_grad_norm_dec, norm_type="inf")
         norm_tf = torch.nn.utils.clip_grad_norm_(self._get_tf_params(), max_norm=self.max_grad_norm_tf)
+        norm_rt = torch.nn.utils.clip_grad_norm_(self._get_rt_params(), max_norm=self.max_grad_norm_rt)
         # print(norm_vae, norm_sa, norm_dec, norm_tf)
         self.scaler.step(self.optimizer_vae)
         self.scaler.step(self.optimizer_sa)
         self.scaler.step(self.optimizer_dec)
         self.scaler.step(self.optimizer_tf)
+        self.scaler.step(self.optimizer_rt)
         self.scaler.update()
 
         if self.scheduler_vae is not None:
@@ -777,11 +802,14 @@ class OCWorldModel(nn.Module):
             self.scheduler_dec.step()
         if self.scheduler_tf is not None:
             self.scheduler_tf.step()
+        if self.scheduler_rt is not None:
+            self.scheduler_rt.step()
             
         self.optimizer_vae.zero_grad(set_to_none=True)
         self.optimizer_sa.zero_grad(set_to_none=True)
         self.optimizer_dec.zero_grad(set_to_none=True)
         self.optimizer_tf.zero_grad(set_to_none=True)
+        self.optimizer_rt.zero_grad(set_to_none=True)
 
         video = torch.cat([obs.unsqueeze(2), obs_hat.unsqueeze(2), attns], dim=2).cpu().detach() # B L N C H W
         video = (video * 255.).numpy().astype(np.uint8)
@@ -796,7 +824,7 @@ class OCWorldModel(nn.Module):
             "world_model/lr_sa": self.optimizer_sa.param_groups[0]["lr"],
             "world_model/lr_dec": self.optimizer_dec.param_groups[0]["lr"],
             "world_model/lr_tf": self.optimizer_tf.param_groups[0]["lr"],
-            "world_model/norm": norm_vae + norm_sa + norm_dec + norm_tf,
+            "world_model/norm": norm_vae + norm_sa + norm_dec + norm_tf + norm_rt,
         }
         if self.loss_type == "slate":
             logs.update({
@@ -830,7 +858,7 @@ class OCWorldModel(nn.Module):
             slots = rearrange(slots, "(B L) N D -> B L N D", B=batch_size)
 
             # slot space to logits
-            pred_logits = self.dist_head.forward_prior(slots)
+            pred_logits, _, mask_as_image = self.dist_head.forward_prior(slots)
             pred_logits = rearrange(pred_logits, "B L K C -> (B L) K C")
             pred_logits = self.out(pred_logits)
             pred_logits = F.one_hot(pred_logits.argmax(dim=-1), self.vocab_size).float()
@@ -838,12 +866,18 @@ class OCWorldModel(nn.Module):
             obs_hat = self.image_decoder(z)
 
             # visualize attention
-            attns = rearrange(attns, 'B N (H W) -> B N H W', H=self.final_feature_width, W=self.final_feature_width)
-            mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
-            mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
-            obs_hat = torch.clamp(obs_hat, 0, 1)
-            attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
-            # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
+            if self.vis_attn_type == "sbd":
+                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+                obs_hat = torch.clamp(obs_hat, 0, 1)
+                attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+                # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
+            elif self.vis_attn_type == "sa":
+                attns = rearrange(attns, 'B N (H W) -> B N H W', H=self.final_feature_width, W=self.final_feature_width)
+                mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
+                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+                obs_hat = torch.clamp(obs_hat, 0, 1)
+                attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
+                # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
 
         video = torch.cat([obs.unsqueeze(2), obs_hat.unsqueeze(2), attns], dim=2).cpu().detach() # B L N C H W
         video = (video * 255.).numpy().astype(np.uint8)
@@ -851,7 +885,7 @@ class OCWorldModel(nn.Module):
 
     def inspect_rollout(self, sample_obs, sample_action, gt_obs, gt_action,
                         imagine_batch_size, imagine_batch_length, logger=None):
-        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device)
+        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device, silent=True)
         obs_hat_list = []
         attns_list = []
 
