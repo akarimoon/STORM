@@ -8,86 +8,21 @@ from torch.distributions import OneHotCategorical, RelaxedOneHotCategorical
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sub_models.oc_world_models import SlotAttention, MSELoss
+from sub_models.oc_world_models import EncoderBN, DecoderBN, SlotAttention, MSELoss, CELoss, OneHotDictionary
 from sub_models.world_models import CategoricalKLDivLossWithFreeBits
 from sub_models.transformer_model import OCStochasticTransformerKVCache
 from sub_models.attention_blocks import PositionalEncoding1D, PositionalEncoding2D, get_causal_mask_with_batch_length
-from sub_models.transformer_utils import SLATETransformerDecoder, resize_patches_to_image
+from sub_models.slate_utils import SLATETransformerDecoder, resize_patches_to_image
 from utils import linear_warmup_exp_decay
 
 
-class Conv2dBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
-        super().__init__()
-        self.m = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=True)
-    
-    def forward(self, x):
-        return F.relu(self.m(x))
-
-
-class EncoderBN(nn.Module):
-    def __init__(self, in_channels, stem_channels, final_feature_width, vocab_size) -> None:
-        super().__init__()
-
-        backbone = [
-            Conv2dBlock(in_channels, stem_channels, 4, 4),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-        ]
-
-        backbone.append(nn.Conv2d(stem_channels, vocab_size, 1))
-
-        self.backbone = nn.Sequential(*backbone)
-        self.last_channels = vocab_size
-
-    def forward(self, x):
-        batch_size = x.shape[0]
-        x = rearrange(x, "B L C H W -> (B L) C H W")
-        x = self.backbone(x)
-        x = F.log_softmax(x, dim=1)
-        x = rearrange(x, "(B L) C H W -> B L C H W", B=batch_size)
-        return x
-    
-
-class DecoderBN(nn.Module):
-    def __init__(self, stoch_dim, last_channels, original_in_channels, stem_channels, final_feature_width, vocab_size) -> None:
-        super().__init__()
-
-        backbone = [
-            Conv2dBlock(vocab_size, stem_channels, 1),
-            Conv2dBlock(stem_channels, stem_channels, 3, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels * 2 * 2, 1),
-            nn.PixelShuffle(2),
-            Conv2dBlock(stem_channels, stem_channels, 3, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels, 1, 1),
-            Conv2dBlock(stem_channels, stem_channels * 2 * 2, 1),
-            nn.PixelShuffle(2),
-            nn.Conv2d(stem_channels, original_in_channels, 1),
-        ]
-
-        self.backbone = nn.Sequential(*backbone)
-
-    def forward(self, sample):
-        batch_size = sample.shape[0]
-        sample = rearrange(sample, "B L C H W -> (B L) C H W")
-        obs_hat = self.backbone(sample)
-        obs_hat = rearrange(obs_hat, "(B L) C H W -> B L C H W", B=batch_size)
-        return obs_hat
-
-
 class SpatialBroadcastMLPDecoder(nn.Module):
-    def __init__(self, dec_input_dim, dec_hidden_layers, stoch_num_classes, stoch_dim) -> None:
+    def __init__(self, dec_input_dim, dec_hidden_layers, stoch_num_classes, stoch_dim, pos_emb_type="2d") -> None:
         super().__init__()
 
         self.stoch_dim = stoch_dim
         self.stoch_num_classes = stoch_num_classes
+        self.pos_emb_type = pos_emb_type
         
         layers = []
         current_dim = dec_input_dim
@@ -103,18 +38,26 @@ class SpatialBroadcastMLPDecoder(nn.Module):
         
         self.layers = nn.Sequential(*layers)
 
-        self.pos_embed = nn.Parameter(torch.randn(1, stoch_num_classes, dec_input_dim) * 0.02)
-        # self.pos_embed = PositionalEncoding1D(stoch_num_classes, dec_input_dim)
+        if pos_emb_type == "1d":
+            self.pos_embed = nn.Parameter(torch.randn(1, stoch_num_classes, dec_input_dim) * 0.02)
+        elif pos_emb_type == "2d":    
+            self.init_resolution = (16, 16)
+            self.pos_embed = PositionalEncoding2D(self.init_resolution, dec_input_dim)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # z (BL N D)
         init_shape = z.shape[:-1]
         z = z.flatten(0, -2)
-        z = z.unsqueeze(1).expand(-1, self.stoch_num_classes, -1)
 
-        # Simple learned additive embedding as in ViT
-        z = z + self.pos_embed
-        # z = self.pos_embed(z)
+        if self.pos_emb_type == "1d":
+            z = z.unsqueeze(1).expand(-1, self.stoch_num_classes, -1)
+            # Simple learned additive embedding as in ViT
+            z = z + self.pos_embed
+        elif self.pos_emb_type == "2d":
+            z = z.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.init_resolution[0], self.init_resolution[1])
+            # Simple learned additive embedding as in ViT
+            z = self.pos_embed(z)
+            z = rearrange(z, "BLN D H W -> BLN (H W) D")
         out = self.layers(z)
         out = out.unflatten(0, init_shape)
 
@@ -227,47 +170,9 @@ class DistHead(nn.Module):
         return logits, None, mask_as_image
 
 
-class OneHotDictionary(nn.Module):
-    def __init__(self, vocab_size, emb_size):
-        super().__init__()
-        self.dictionary = nn.Embedding(vocab_size, emb_size)
-
-    def forward(self, x):
-        """
-        x: B, N, vocab_size
-        """
-
-        tokens = torch.argmax(x, dim=-1)  # batch_size x N
-        token_embs = self.dictionary(tokens)  # batch_size x N x emb_size
-        return token_embs
-    
-
-class CELoss(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, logits_hat, logits):
-        loss = -(logits * F.log_softmax(logits_hat, dim=-1))
-        loss = reduce(loss, "B L K C -> B L", "sum")
-        return loss.mean()
-    
-
-class KLDivLoss(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, q_logits, p_logits):
-        p_dist = OneHotCategorical(logits=p_logits)
-        q_dist = OneHotCategorical(logits=q_logits)
-        kl_div = torch.distributions.kl.kl_divergence(p_dist, q_dist)
-        kl_div = reduce(kl_div, "B L D -> B L", "sum")
-        kl_div = kl_div.mean()
-        return kl_div
-
-
 class SLATE(nn.Module):
     def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, num_slots, slot_dim, dec_hidden_dim, dec_num_layers, vocab_size, post_type,
-                 loss_type, lr_vae, lr_sa, max_grad_norm_vae, max_grad_norm_sa, lr_warmup_steps, tau_anneal_steps) -> None:
+                 loss_type, lr_vae, lr_sa, lr_dec, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, lr_warmup_steps, tau_anneal_steps, vis_attn_type) -> None:
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -280,13 +185,12 @@ class SLATE(nn.Module):
         self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
-        self.post_type = post_type
         self.loss_type = loss_type
+        self.vis_attn_type = vis_attn_type
 
         self.encoder = EncoderBN(
             in_channels=in_channels,
             stem_channels=stem_channels,
-            final_feature_width=self.final_feature_width,
             vocab_size=vocab_size
         )
         self.slot_attn = SlotAttention(
@@ -305,11 +209,8 @@ class SLATE(nn.Module):
             post_type=post_type
         )
         self.image_decoder = DecoderBN(
-            stoch_dim=self.stoch_flattened_dim,
-            last_channels=self.encoder.last_channels,
             original_in_channels=in_channels,
             stem_channels=stem_channels,
-            final_feature_width=self.final_feature_width,
             vocab_size=vocab_size
         )
         self.dict = OneHotDictionary(vocab_size, stoch_dim)
@@ -322,18 +223,16 @@ class SLATE(nn.Module):
         self.mse_loss_func = MSELoss()
         self.ce_loss = CELoss()
         self.categorical_kl_div_loss = CategoricalKLDivLossWithFreeBits(free_bits=1)
-        self.kl_loss = KLDivLoss()
         
         self.optimizer_vae = torch.optim.Adam(self._get_vae_params(), lr=lr_vae)
         self.optimizer_sa = torch.optim.Adam(self._get_sa_params(), lr=lr_sa)
-        self.optimizer_dec = torch.optim.Adam(self._get_dec_params(), lr=lr_vae)
+        self.optimizer_dec = torch.optim.Adam(self._get_dec_params(), lr=lr_dec)
         self.scheduler_vae = None
-        # self.scheduler_sa = None
-        # self.scheduler_vae = torch.optim.lr_scheduler.LambdaLR(self.optimizer_vae, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps, None))
         self.scheduler_sa = torch.optim.lr_scheduler.LambdaLR(self.optimizer_sa, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps, 0.5, 250000))
         self.scheduler_dec = torch.optim.lr_scheduler.LambdaLR(self.optimizer_dec, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps, 0.5, 250000))
         self.max_grad_norm_vae = max_grad_norm_vae
         self.max_grad_norm_sa = max_grad_norm_sa
+        self.max_grad_norm_dec = max_grad_norm_dec
         self.tau_anneal_steps = tau_anneal_steps
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
@@ -422,13 +321,12 @@ class SLATE(nn.Module):
             obs_hat = self.image_decoder(z)
 
             # visualize attention
-            if self.post_type == 'mlp':
+            if self.vis_attn_type == 'sbd':
                 mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
                 obs_hat = torch.clamp(obs_hat, 0, 1)
                 attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
                 # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
-
-            elif self.post_type == 'conv':
+            elif self.vis_attn_type == 'sa':
                 attns = rearrange(attns, 'B N (H W) -> B N H W', H=self.final_feature_width, W=self.final_feature_width)
                 mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
                 mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
@@ -483,13 +381,12 @@ class SLATE(nn.Module):
                 total_loss = reconstruction_loss + 0.5*dynamics_loss + 0.1*representation_loss
 
             # visualize attention
-            if self.post_type == 'mlp':
+            if self.vis_attn_type == 'sbd':
                 mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
                 obs_hat = torch.clamp(obs_hat, 0, 1)
                 attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
                 # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
-
-            elif self.post_type == 'conv':
+            elif self.vis_attn_type == 'sa':
                 attns = rearrange(attns, 'B N (H W) -> B N H W', H=self.final_feature_width, W=self.final_feature_width)
                 mask_as_image = attns.repeat_interleave(H // self.final_feature_width, dim=-2).repeat_interleave(W // self.final_feature_width, dim=-1)
                 mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
@@ -506,7 +403,7 @@ class SLATE(nn.Module):
         self.scaler.unscale_(self.optimizer_dec)  # for clip grad
         norm_vae = torch.nn.utils.clip_grad_norm_(self._get_vae_params(), max_norm=self.max_grad_norm_vae, norm_type="inf")
         norm_sa = torch.nn.utils.clip_grad_norm_(self._get_sa_params(), max_norm=self.max_grad_norm_sa, norm_type="inf")
-        norm_dec = torch.nn.utils.clip_grad_norm_(self._get_dec_params(), max_norm=self.max_grad_norm_vae, norm_type="inf")
+        norm_dec = torch.nn.utils.clip_grad_norm_(self._get_dec_params(), max_norm=self.max_grad_norm_dec, norm_type="inf")
         # print(norm_vae, norm_sa, norm_dec)
         self.scaler.step(self.optimizer_vae)
         self.scaler.step(self.optimizer_sa)
@@ -767,11 +664,6 @@ class SLATEWorldModel(SLATE):
         rollout = torch.cat([obs.unsqueeze(2), obs_hat_list.unsqueeze(2), attns_list], dim=2).cpu().detach() # B L K C H W
         rollout = (rollout * 255.).numpy().astype(np.uint8)
         return rollout
-
-        # rollout = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).unsqueeze(2).cpu().detach() # B L K C H W
-        # rollout = (rollout * 255.).numpy().astype(np.uint8)
-
-        # return torch.cat([self.calc_slots(self.latent_buffer, is_flat=True), self.hidden_buffer], dim=-1), self.action_buffer, rollout
 
     def update(self, obs, action, reward, termination, logger=None):
         train_only_tf = False

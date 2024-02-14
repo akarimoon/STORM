@@ -37,8 +37,10 @@ world_model:
   _target_: sub_models.slate.SLATE
   lr_vae: 0.0003
   lr_sa: 0.0001
+  lr_dec: 0.0003
   max_grad_norm_vae: 0.05 # or 1
   max_grad_norm_sa: 0.05 # or 1
+  max_grad_norm_dec: 0.05 # or 1
   in_channels: 3
   stem_channels: 64
   stoch_num_classes: 256
@@ -52,3 +54,4 @@ world_model:
   loss_type: slate
   lr_warmup_steps: 30000
   tau_anneal_steps: 30000
+  vis_attn_type: sa
