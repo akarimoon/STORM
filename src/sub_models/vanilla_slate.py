@@ -10,7 +10,7 @@ from sub_models.oc_world_models import SlotAttention, SpatialBroadcastMLPDecoder
 from sub_models.world_models import CategoricalKLDivLossWithFreeBits
 from sub_models.transformer_model import OCStochasticTransformerKVCache
 from sub_models.attention_blocks import PositionalEncoding1D, PositionalEncoding2D, get_causal_mask_with_batch_length
-from sub_models.transformer_utils import SLATETransformerDecoder, resize_patches_to_image
+from sub_models.slate_utils import SLATETransformerDecoder, resize_patches_to_image
 from utils import linear_warmup_exp_decay
 
 
