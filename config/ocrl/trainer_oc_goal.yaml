@@ -86,6 +86,9 @@ world_model:
   transformer_num_layers: 2
   transformer_num_heads: 8
   transformer_max_length: 64
+  emb_type: 2emb
+  post_type: conv
+  mask_type: block
   loss_type: slate
   agent_state_type: both
   lr_warmup_steps: -1
@@ -102,5 +105,5 @@ agent:
   gamma: 0.985
   lambd: 0.95
   entropy_coef: 3.0e-4
-  lr: 5.0e-5
-  max_grad_norm: 0.05
+  lr: 3.0e-4 # 5.0e-5
+  max_grad_norm: 0.2
