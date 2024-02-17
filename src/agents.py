@@ -194,6 +194,7 @@ class TransformerWithCLS(nn.Module):
         self._cls_token = nn.Parameter(torch.zeros(d_model))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model, num_heads,
+            batch_first=True,
             #norm_first=norm_first
         )
         self._trans = nn.TransformerEncoder(encoder_layer, num_layers)
@@ -242,25 +243,25 @@ class OCActorCriticAgent(ActorCriticAgent):
                  lr, max_grad_norm) -> None:
         super().__init__(feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, lr, max_grad_norm)
 
-        # shared_transformer = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
-        shared_transformer = MLP(feat_dim, hidden_dim)
-        # shared_mlp = nn.Sequential(
-        #     nn.Linear(hidden_dim, mlp_hidden_dim),
-        #     nn.LayerNorm(mlp_hidden_dim),
-        #     nn.ReLU(inplace=True),
-        #     nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
-        #     nn.LayerNorm(mlp_hidden_dim),
-        #     nn.ReLU(inplace=True)
-        # )
+        shared_transformer = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
+        # shared_transformer = MLP(feat_dim, hidden_dim)
+        shared_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden_dim),
+            nn.LayerNorm(mlp_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
+            nn.LayerNorm(mlp_hidden_dim),
+            nn.ReLU(inplace=True)
+        )
         self.actor = nn.Sequential(
             shared_transformer,
-            # shared_mlp,
-            nn.Linear(hidden_dim, action_dim)
+            shared_mlp,
+            nn.Linear(mlp_hidden_dim, action_dim)
         )
         self.critic = nn.Sequential(
             shared_transformer,
-            # shared_mlp,
-            nn.Linear(hidden_dim, 255)
+            shared_mlp,
+            nn.Linear(mlp_hidden_dim, 255)
         )
 
         self.slow_critic = copy.deepcopy(self.critic)
