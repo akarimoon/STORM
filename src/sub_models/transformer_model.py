@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from einops import repeat, rearrange
 
 from sub_models.attention_blocks import get_vector_mask
-from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache, OCPositionalEncoding1D
+from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache, OCPositionalEncoding1D, OCPositionalEncoding1D2Emb
 
 
 class StochasticTransformer(nn.Module):
@@ -103,7 +103,7 @@ class StochasticTransformerKVCache(nn.Module):
     
 
 class OCStochasticTransformerKVCache(nn.Module):
-    def __init__(self, stoch_dim, action_dim, feat_dim, num_slots, num_layers, num_heads, max_length, dropout):
+    def __init__(self, stoch_dim, action_dim, feat_dim, num_slots, num_layers, num_heads, max_length, dropout, emb_type):
         super().__init__()
         self.action_dim = action_dim
         self.feat_dim = feat_dim
@@ -117,7 +117,10 @@ class OCStochasticTransformerKVCache(nn.Module):
             nn.Linear(feat_dim, feat_dim, bias=False),
             nn.LayerNorm(feat_dim)
         )
-        self.position_encoding = OCPositionalEncoding1D(max_length=max_length, num_slots=num_slots, embed_dim=feat_dim)
+        if emb_type == '1emb':
+            self.position_encoding = OCPositionalEncoding1D(max_length=max_length, num_slots=num_slots, embed_dim=feat_dim)
+        elif emb_type == '2emb':
+            self.position_encoding = OCPositionalEncoding1D2Emb(max_length=max_length, num_slots=num_slots, embed_dim=feat_dim)
         self.layer_stack = nn.ModuleList([
             AttentionBlockKVCache(feat_dim=feat_dim, hidden_dim=feat_dim*2, num_heads=num_heads, dropout=dropout) for _ in range(num_layers)
         ])
@@ -135,14 +138,13 @@ class OCStochasticTransformerKVCache(nn.Module):
         action = F.one_hot(action.long(), self.action_dim).float()
         action = repeat(action, "B L A -> B L N A", N=N)
         feats = self.stem(torch.cat([samples, action], dim=-1))
-        feats = rearrange(feats, "B L K D -> B (L K) D")
-        feats = self.position_encoding(feats)
+        feats = self.position_encoding(feats) # B L N D -> B (L N) D
         feats = self.layer_norm(feats)
 
         for layer in self.layer_stack:
             feats, attn = layer(feats, feats, feats, mask)
 
-        feats = rearrange(feats, "B (L K) D -> B L K D", L=L)
+        feats = rearrange(feats, "B (L N) D -> B L N D", L=L)
         return feats
 
     def reset_kv_cache_list(self, batch_size, dtype, device):
@@ -164,7 +166,6 @@ class OCStochasticTransformerKVCache(nn.Module):
         action = F.one_hot(action.long(), self.action_dim).float()
         action = repeat(action, "B L A -> B L N A", N=N)
         feats = self.stem(torch.cat([samples, action], dim=-1))
-        feats = rearrange(feats, "B L K D -> B (L K) D")
         feats = self.position_encoding.forward_with_position(feats, position=self.kv_cache_list[0].shape[1])
         feats = self.layer_norm(feats)
 
@@ -172,5 +173,5 @@ class OCStochasticTransformerKVCache(nn.Module):
             self.kv_cache_list[idx] = torch.cat([self.kv_cache_list[idx], feats], dim=1)
             feats, attn = layer(feats, self.kv_cache_list[idx], self.kv_cache_list[idx], mask)
 
-        feats = rearrange(feats, "B (L K) D -> B L K D", L=L)
+        feats = rearrange(feats, "B (L N) D -> B L N D", L=L)
         return feats

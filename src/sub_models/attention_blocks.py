@@ -208,18 +208,59 @@ class OCPositionalEncoding1D(nn.Module):
 
     def forward(self, feat):
         pos_emb = self.pos_emb(torch.arange(self.max_length*self.num_slots, device=feat.device))
-        pos_emb = repeat(pos_emb, "L D -> B L D", B=feat.shape[0])
+        pos_emb = repeat(pos_emb, "LN D -> B LN D", B=feat.shape[0])
 
+        feat = rearrange(feat, "B L N D -> B (L N) D")
         feat = feat + pos_emb[:, :feat.shape[1], :]
         return feat
 
     def forward_with_position(self, feat, position):
         pos_emb = self.pos_emb(torch.arange(self.max_length*self.num_slots, device=feat.device))
-        pos_emb = repeat(pos_emb, "L D -> B L D", B=feat.shape[0])
+        pos_emb = repeat(pos_emb, "LN D -> B LN D", B=feat.shape[0])
 
+        feat = rearrange(feat, "B L N D -> B (L N) D")
         feat = feat + pos_emb[:, position:position+self.num_slots, :]
         return feat
     
+
+class OCPositionalEncoding1D2Emb(nn.Module):
+    def __init__(
+        self,
+        max_length: int,
+        num_slots: int,
+        embed_dim: int
+    ):
+        super().__init__()
+        self.max_length = max_length
+        self.num_slots = num_slots
+        self.embed_dim = embed_dim
+
+        self.pos_emb = nn.Embedding(self.max_length, embed_dim)
+        self.slot_emb = nn.Embedding(self.num_slots, embed_dim)
+
+    def forward(self, feat):
+        pos_emb = self.pos_emb(torch.arange(self.max_length, device=feat.device)).repeat(1, self.num_slots, 1)
+        pos_emb = repeat(pos_emb, "L N D -> B (L N) D", B=feat.shape[0])
+
+        slot_emb = self.slot_emb(torch.arange(self.num_slots, device=feat.device)).repeat(1, self.max_length, 1)
+        slot_emb = repeat(slot_emb, "N L D -> B (L N) D", B=feat.shape[0])
+
+        feat = rearrange(feat, "B L N D -> B (L N) D")
+        feat = feat + pos_emb[:, :feat.shape[1], :] + slot_emb[:, :feat.shape[1], :]
+        return feat
+
+    def forward_with_position(self, feat, position):
+        pos_emb = self.pos_emb(torch.arange(self.max_length, device=feat.device)).repeat(1, self.num_slots, 1)
+        pos_emb = repeat(pos_emb, "L N D -> B (L N) D", B=feat.shape[0])
+
+        slot_emb = self.slot_emb(torch.arange(self.num_slots, device=feat.device)).repeat(1, self.max_length, 1)
+        slot_emb = repeat(slot_emb, "N L D -> B (L N) D", B=feat.shape[0])
+
+        feat = rearrange(feat, "B L K D -> B (L K) D")
+        feat = feat + pos_emb[:, position:position+self.num_slots, :] + slot_emb[:, position:position+self.num_slots, :]
+        return feat
+    
+
 class PositionalEncoding2D(nn.Module):
     def __init__(self, resolution, channels):
         super().__init__()
