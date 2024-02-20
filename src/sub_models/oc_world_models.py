@@ -12,9 +12,9 @@ from torch.cuda.amp import autocast
 import wandb
 
 from sub_models.functions_losses import SymLogTwoHotLoss
-from sub_models.attention_blocks import get_causal_mask_with_batch_length, get_causal_mask, PositionalEncoding1D, PositionalEncoding2D
+from sub_models.attention_blocks import get_causal_mask_with_batch_length, get_causal_mask, PositionalEncoding1D, PositionalEncoding2D, get_subsequent_mask_with_batch_length, get_subsequent_mask
 from sub_models.transformer_model import OCStochasticTransformerKVCache
-from sub_models.transformer_utils import SLATETransformerDecoder, SLATETransformerDecoderKVCache, resize_patches_to_image
+from sub_models.slate_utils import resize_patches_to_image
 from utils import linear_warmup_exp_decay
 
 class Conv2dBlock(nn.Module):
@@ -177,6 +177,62 @@ class SlotAttention(nn.Module):
         return slots, dots.softmax(dim=1)
 
 
+class SpatialBroadcastMLPDecoder(nn.Module):
+    def __init__(self, dec_input_dim, dec_hidden_layers, stoch_num_classes, stoch_dim, pos_emb_type="2d") -> None:
+        super().__init__()
+
+        self.stoch_dim = stoch_dim
+        self.stoch_num_classes = stoch_num_classes
+        self.pos_emb_type = pos_emb_type
+        
+        layers = []
+        current_dim = dec_input_dim
+    
+        for dec_hidden_dim in dec_hidden_layers:
+            layers.append(nn.Linear(current_dim, dec_hidden_dim))
+            nn.init.zeros_(layers[-1].bias)
+            layers.append(nn.ReLU(inplace=True))
+            current_dim = dec_hidden_dim
+
+        layers.append(nn.Linear(current_dim, stoch_dim+1))
+        nn.init.zeros_(layers[-1].bias)
+        
+        self.layers = nn.Sequential(*layers)
+
+        if pos_emb_type == "1d":
+            self.pos_embed = nn.Parameter(torch.randn(1, stoch_num_classes, dec_input_dim) * 0.02)
+        elif pos_emb_type == "2d":    
+            self.init_resolution = (16, 16)
+            self.pos_embed = PositionalEncoding2D(self.init_resolution, dec_input_dim)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z (BL N D)
+        init_shape = z.shape[:-1]
+        z = z.flatten(0, -2)
+
+        if self.pos_emb_type == "1d":
+            z = z.unsqueeze(1).expand(-1, self.stoch_num_classes, -1)
+            # Simple learned additive embedding as in ViT
+            z = z + self.pos_embed
+        elif self.pos_emb_type == "2d":
+            z = z.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.init_resolution[0], self.init_resolution[1])
+            # Simple learned additive embedding as in ViT
+            z = self.pos_embed(z)
+            z = rearrange(z, "BLN D H W -> BLN (H W) D")
+        out = self.layers(z)
+        out = out.unflatten(0, init_shape)
+
+        # Split out alpha channel and normalize over slots.
+        decoded_patches, alpha = out.split([self.stoch_dim, 1], dim=-1)
+        alpha = alpha.softmax(dim=-3)
+
+        reconstruction = torch.sum(decoded_patches * alpha, dim=-3)
+        masks = alpha.squeeze(-1)
+        masks_as_image = resize_patches_to_image(masks, size=64, resize_mode="bilinear")
+
+        return reconstruction, masks, masks_as_image
+    
+
 class SpatialBroadcastConvDecoder(nn.Module):
     def __init__(self, dec_input_dim, dec_hidden_layers, stoch_num_classes, stoch_dim) -> None:
         super().__init__()
@@ -225,15 +281,23 @@ class DistHead(nn.Module):
     '''
     Dist: abbreviation of distribution
     '''
-    def __init__(self, transformer_hidden_dim, dec_hidden_dim, dec_num_layers, stoch_num_classes, stoch_dim) -> None:
+    def __init__(self, transformer_hidden_dim, dec_hidden_dim, dec_num_layers, stoch_num_classes, stoch_dim, post_type) -> None:
         super().__init__()
         self.stoch_dim = stoch_dim
-        self.prior_head = SpatialBroadcastConvDecoder(
-            dec_input_dim=transformer_hidden_dim,
-            dec_hidden_layers=[dec_hidden_dim] * dec_num_layers,
-            stoch_num_classes=stoch_num_classes,
-            stoch_dim=stoch_dim
-        )
+        if post_type == 'mlp':
+            self.prior_head = SpatialBroadcastMLPDecoder(
+                dec_input_dim=transformer_hidden_dim,
+                dec_hidden_layers=[dec_hidden_dim] * dec_num_layers,
+                stoch_num_classes=stoch_num_classes,
+                stoch_dim=stoch_dim
+            )
+        elif post_type == 'conv':
+            self.prior_head = SpatialBroadcastConvDecoder(
+                dec_input_dim=transformer_hidden_dim,
+                dec_hidden_layers=[dec_hidden_dim] * dec_num_layers,
+                stoch_num_classes=stoch_num_classes,
+                stoch_dim=stoch_dim
+            )
 
     def gumbel_softmax(self, logits, tau=1., hard=False, dim=-1):
         eps = torch.finfo(logits.dtype).tiny
@@ -363,9 +427,10 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 class OCWorldModel(nn.Module):
     def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, num_slots, slot_dim, dec_hidden_dim, dec_num_layers, vocab_size,
-                 transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, loss_type, agent_state_type,
+                 transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, emb_type,
+                 post_type, mask_type, loss_type, agent_state_type, vis_attn_type, 
                  lr_vae, lr_sa, lr_dec, lr_tf, lr_rt, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, max_grad_norm_tf, max_grad_norm_rt,
-                 lr_warmup_steps, tau_anneal_steps, coef_anneal_steps, vis_attn_type) -> None:
+                 lr_warmup_steps, tau_anneal_steps, coef_anneal_steps) -> None:
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -375,12 +440,13 @@ class OCWorldModel(nn.Module):
         self.stoch_flattened_dim = self.stoch_num_classes*self.stoch_dim
         self.vocab_size = vocab_size
         self.transformer_hidden_dim = transformer_hidden_dim
+        self.mask_type = mask_type
         self.loss_type = loss_type
+        self.vis_attn_type = vis_attn_type
         self.agent_state_type = agent_state_type
         self.lr_warmup_steps = lr_warmup_steps
         self.tau_anneal_steps = tau_anneal_steps
         self.coef_anneal_steps = coef_anneal_steps
-        self.vis_attn_type = vis_attn_type
         self.use_amp = True
         self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
@@ -406,13 +472,15 @@ class OCWorldModel(nn.Module):
             num_heads=transformer_num_heads,
             max_length=transformer_max_length,
             dropout=0.1,
+            emb_type=emb_type
         )
         self.dist_head = DistHead(
             transformer_hidden_dim=slot_dim,
             dec_hidden_dim=dec_hidden_dim,
             dec_num_layers=dec_num_layers,
             stoch_num_classes=stoch_num_classes,
-            stoch_dim=self.stoch_dim
+            stoch_dim=self.stoch_dim,
+            post_type=post_type
         )
         self.image_decoder = DecoderBN(
             original_in_channels=in_channels,
@@ -458,6 +526,8 @@ class OCWorldModel(nn.Module):
         self.scheduler_vae = None
         self.scheduler_sa = None
         self.scheduler_dec = None
+        # self.scheduler_sa = torch.optim.lr_scheduler.LambdaLR(self.optimizer_sa, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps, 0.5, 250000))
+        # self.scheduler_dec = torch.optim.lr_scheduler.LambdaLR(self.optimizer_sa, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps, 0.5, 250000))
         self.scheduler_tf = None
         self.scheduler_rt = None
         # self.scheduler_rt = torch.optim.lr_scheduler.LambdaLR(self.optimizer_rt, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps))
@@ -560,7 +630,10 @@ class OCWorldModel(nn.Module):
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             slots = self.calc_slots(latent, return_attn=False)
-            temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, latent.device)
+            if self.mask_type == "block":
+                temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, latent.device)
+            elif self.mask_type == "subsequent":
+                temporal_mask = get_subsequent_mask_with_batch_length(batch_length*self.num_slots, latent.device)
             slots_hat = self.storm_transformer(slots, action, temporal_mask)
             last_slots_hat = slots_hat[:, -1:]
             last_slots_hat_ = self.slot_proj(last_slots_hat)
@@ -617,6 +690,22 @@ class OCWorldModel(nn.Module):
                 # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
 
         return obs_hat, reward_hat, termination_hat, sample, hidden_hat, attns
+    
+    def cosine_anneal(self, start_value, final_value, start_step, final_step):
+        assert start_value >= final_value
+        assert start_step <= final_step
+        
+        if self.step < start_step:
+            value = start_value
+        elif self.step >= final_step:
+            value = final_value
+        else:
+            a = 0.5 * (start_value - final_value)
+            b = 0.5 * (start_value + final_value)
+            progress = (self.step - start_step) / (final_step - start_step)
+            value = a * math.cos(math.pi * progress) + b
+        
+        return value
     
     def coef_warmup(self, steps):
         multiplier = 1.0
@@ -712,6 +801,7 @@ class OCWorldModel(nn.Module):
         batch_size, batch_length = obs.shape[:2]
         H, W = obs.shape[-2:]
         tau = 0.1
+        # tau = self.cosine_anneal(1.0, 0.1, 0, self.tau_anneal_steps)
         coef_ = self.coef_warmup(self.coef_anneal_steps)
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):            
@@ -731,7 +821,10 @@ class OCWorldModel(nn.Module):
             obs_hat = self.image_decoder(soft)
             
             # transformer
-            temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, soft.device)
+            if self.mask_type == "block":
+                temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, soft.device)
+            elif self.mask_type == "subsequent":
+                temporal_mask = get_subsequent_mask_with_batch_length(batch_length*self.num_slots, soft.device)
             slots_hat = self.storm_transformer(slots, action, temporal_mask) # B L N D
             # decoding reward and termination with slots_hat
             reward_hat = self.reward_decoder(slots_hat)
@@ -814,6 +907,8 @@ class OCWorldModel(nn.Module):
         video = torch.cat([obs.unsqueeze(2), obs_hat.unsqueeze(2), attns], dim=2).cpu().detach() # B L N C H W
         video = (video * 255.).numpy().astype(np.uint8)
 
+        tokens = torch.argmax(post_logits, dim=-1)
+        prior_tokens = torch.argmax(prior_logits, dim=-1)
         logs = {
             "world_model/reconstruction_loss": reconstruction_loss.item(),
             "world_model/reward_loss": reward_loss.item(),
@@ -825,6 +920,10 @@ class OCWorldModel(nn.Module):
             "world_model/lr_dec": self.optimizer_dec.param_groups[0]["lr"],
             "world_model/lr_tf": self.optimizer_tf.param_groups[0]["lr"],
             "world_model/norm": norm_vae + norm_sa + norm_dec + norm_tf + norm_rt,
+            "tokens/token_usage": len(torch.unique(tokens)) / self.vocab_size,
+            "tokens/token_usage_prior": len(torch.unique(prior_tokens)) / self.vocab_size,
+            "tokens/token_hist": wandb.Histogram(tokens.cpu().numpy().flatten()),
+            "tokens/variance": self.dict.dictionary.weight.var().item(),
         }
         if self.loss_type == "slate":
             logs.update({

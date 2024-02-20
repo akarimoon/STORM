@@ -47,11 +47,11 @@ world_model:
   stoch_dim: 192
   num_slots: 7
   slot_dim: 192
-  dec_hidden_dim: 32
+  dec_hidden_dim: 512
   dec_num_layers: 2
   vocab_size: 4096
-  post_type: conv
+  post_type: mlp
   loss_type: slate
   lr_warmup_steps: 30000
   tau_anneal_steps: 30000
-  vis_attn_type: sa
+  vis_attn_type: sbd

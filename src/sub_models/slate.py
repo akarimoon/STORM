@@ -7,6 +7,7 @@ import torch
 from torch.distributions import OneHotCategorical, RelaxedOneHotCategorical
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 
 from sub_models.oc_world_models import EncoderBN, DecoderBN, SlotAttention, MSELoss, CELoss, OneHotDictionary
 from sub_models.world_models import CategoricalKLDivLossWithFreeBits
@@ -353,6 +354,7 @@ class SLATE(nn.Module):
 
             # slot attention
             hard = rearrange(hard, "B L K C -> (B L) K C")
+            tokens = torch.argmax(hard, dim=-1)
             z_emb = self.dict(hard)
             z_emb = self.pos_embed(z_emb)
             slots, attns = self.slot_attn(z_emb)
@@ -432,6 +434,9 @@ class SLATE(nn.Module):
             "world_model/lr_sa": self.optimizer_sa.param_groups[0]["lr"],
             "world_model/lr_dec": self.optimizer_dec.param_groups[0]["lr"],
             "world_model/norm": norm_vae + norm_sa + norm_dec,
+            "tokens/token_usage": len(torch.unique(tokens)) / self.vocab_size,
+            "tokens/token_hist": wandb.Histogram(tokens.cpu().numpy().flatten()),
+            "tokens/variance": self.dict.dictionary.weight.var().item(),
         }
         if self.loss_type == "slate":
             logs.update({
