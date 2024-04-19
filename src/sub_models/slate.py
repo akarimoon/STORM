@@ -173,7 +173,8 @@ class DistHead(nn.Module):
 
 class SLATE(nn.Module):
     def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, num_slots, slot_dim, dec_hidden_dim, dec_num_layers, vocab_size, post_type,
-                 loss_type, lr_vae, lr_sa, lr_dec, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, lr_warmup_steps, tau_anneal_steps, vis_attn_type) -> None:
+                 loss_type, lr_vae, lr_sa, lr_dec, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, lr_warmup_steps, tau_anneal_steps, vis_attn_type,
+                 enable_dict_reset=False) -> None:
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -214,7 +215,7 @@ class SLATE(nn.Module):
             stem_channels=stem_channels,
             vocab_size=vocab_size
         )
-        self.dict = OneHotDictionary(vocab_size, stoch_dim)
+        self.dict = OneHotDictionary(vocab_size, stoch_dim, enable_reset=enable_dict_reset)
         self.pos_embed = nn.Sequential(
             PositionalEncoding1D(stoch_num_classes, stoch_dim, weight_init="trunc_normal"),
             nn.Dropout(0.1)
@@ -437,6 +438,8 @@ class SLATE(nn.Module):
             "tokens/token_usage": len(torch.unique(tokens)) / self.vocab_size,
             "tokens/token_hist": wandb.Histogram(tokens.cpu().numpy().flatten()),
             "tokens/variance": self.dict.dictionary.weight.var().item(),
+            "tokens/dist_from_init": self.dict.dist_from_init.mean().item(),
+            "tokens/dist_hist": wandb.Histogram(self.dict.dist_from_init.cpu().numpy().flatten()),
         }
         if self.loss_type == "slate":
             logs.update({

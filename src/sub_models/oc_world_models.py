@@ -375,9 +375,19 @@ class TerminationDecoder(nn.Module):
 
 
 class OneHotDictionary(nn.Module):
-    def __init__(self, vocab_size, emb_size):
+    def __init__(self, vocab_size, emb_size, enable_reset=False):
         super().__init__()
         self.dictionary = nn.Embedding(vocab_size, emb_size)
+        self.vocab_size = vocab_size
+
+        self.usage_count = torch.zeros(vocab_size)
+        self.step_count = 0
+        self._thres = 0.1
+        self.last_seen_x = None
+        self.init_dict = self.dictionary.weight.data.clone()
+        self.dist_from_init = torch.zeros(vocab_size)
+
+        self.enable_reset = enable_reset
 
     def forward(self, x):
         """
@@ -386,8 +396,23 @@ class OneHotDictionary(nn.Module):
 
         tokens = torch.argmax(x, dim=-1)  # batch_size x N
         token_embs = self.dictionary(tokens)  # batch_size x N x emb_size
+
+        if self.training:
+            self.last_seen_x = rearrange(token_embs, "B K C -> (B K) C")
+            self.usage_count += F.one_hot(tokens, num_classes=self.vocab_size).float().sum(dim=(0,1)).detach().cpu()
+            self.dist_from_init = torch.norm(self.dictionary.weight.data - self.init_dict.to(x.device), dim=-1)
+            self.step_count += 1
+
+            if self.enable_reset and self.step_count % 1000 == 0:
+                self.reset_unused_tokens(x.device)
+
         return token_embs
     
+    def reset_unused_tokens(self, device):
+        target_ids = torch.where(self.usage_count / self.step_count < self._thres)[0]
+        most_used_ids = torch.argsort(self.usage_count, descending=True)[1:]
+        rand_ids = torch.tensor(np.random.choice(most_used_ids, len(target_ids), replace=False)).to(device)
+        self.dictionary.weight.data[target_ids] = self.dictionary.weight.data[rand_ids] + torch.randn_like(self.dictionary.weight.data[rand_ids]) / 100
 
 class MSELoss(nn.Module):
     def __init__(self) -> None:
@@ -791,7 +816,8 @@ class OCWorldModel(nn.Module):
         return states, self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer, rollout
 
     def update(self, obs, action, reward, termination, logger=None):
-        freeze_dict = True
+        # freeze_dict = True
+        freeze_dict = False
         if freeze_dict:
             self.train()
             self.dict.eval()
