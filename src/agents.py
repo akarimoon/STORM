@@ -87,6 +87,10 @@ class ActorCriticAgent(nn.Module):
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
+    def load(self, path_to_checkpoint, device):
+        state_dict = torch.load(path_to_checkpoint, map_location=device)
+        self.load_state_dict(state_dict)
+
     @torch.no_grad()
     def update_slow_critic(self, decay=0.98):
         for slow_param, param in zip(self.slow_critic.parameters(), self.critic.parameters()):
