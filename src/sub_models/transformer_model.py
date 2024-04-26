@@ -103,11 +103,13 @@ class StochasticTransformerKVCache(nn.Module):
     
 
 class OCStochasticTransformerKVCache(nn.Module):
-    def __init__(self, stoch_dim, action_dim, feat_dim, num_slots, num_layers, num_heads, max_length, dropout, emb_type):
+    def __init__(self, stoch_dim, action_dim, feat_dim, num_slots, num_layers, num_heads, max_length, dropout, 
+                 emb_type, skip_connection=False):
         super().__init__()
         self.action_dim = action_dim
         self.feat_dim = feat_dim
         self.num_slots = num_slots
+        self.skip_connection = skip_connection
 
         # mix image_embedding and action
         self.stem = nn.Sequential(
@@ -141,11 +143,16 @@ class OCStochasticTransformerKVCache(nn.Module):
         feats = self.position_encoding(feats) # B L N D -> B (L N) D
         feats = self.layer_norm(feats)
 
+        out = feats
         for layer in self.layer_stack:
-            feats, attn = layer(feats, feats, feats, mask)
+            out, attn = layer(out, feats, feats, mask)
 
-        feats = rearrange(feats, "B (L N) D -> B L N D", L=L)
-        return feats
+        if self.skip_connection:
+            out = out + feats
+        else:
+            out = out
+        out = rearrange(out, "B (L N) D -> B L N D", L=L)
+        return out
 
     def reset_kv_cache_list(self, batch_size, dtype, device):
         '''
@@ -169,9 +176,14 @@ class OCStochasticTransformerKVCache(nn.Module):
         feats = self.position_encoding.forward_with_position(feats, position=self.kv_cache_list[0].shape[1])
         feats = self.layer_norm(feats)
 
+        out = feats
         for idx, layer in enumerate(self.layer_stack):
-            self.kv_cache_list[idx] = torch.cat([self.kv_cache_list[idx], feats], dim=1)
-            feats, attn = layer(feats, self.kv_cache_list[idx], self.kv_cache_list[idx], mask)
+            self.kv_cache_list[idx] = torch.cat([self.kv_cache_list[idx], out], dim=1)
+            out, attn = layer(out, self.kv_cache_list[idx], self.kv_cache_list[idx], mask)
 
-        feats = rearrange(feats, "B (L N) D -> B L N D", L=L)
-        return feats
+        if self.skip_connection:
+            out = out + feats
+        else:
+            out = out
+        out = rearrange(out, "B (L N) D -> B L N D", L=L)
+        return out
