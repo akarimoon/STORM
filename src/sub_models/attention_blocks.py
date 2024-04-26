@@ -36,6 +36,35 @@ def get_causal_mask_with_batch_length(batch_length, num_slots, device):
     return mask
 
 
+def get_causal_sparse_mask(seq):
+    ''' For masking out the subsequent info w/ block. '''
+    def create_sparse_mask(batch_length, num_slots):
+        tensor = torch.zeros(batch_length*num_slots, batch_length*num_slots, dtype=torch.int)
+        for i in range(1, batch_length+1):
+            tensor = torch.diagonal_scatter(tensor, torch.ones((batch_length-i)*num_slots), offset=-num_slots*i)
+        return tensor
+    
+    batch_size, batch_length, num_slots = seq.shape[:3]
+    sparse_ = create_sparse_mask(batch_length, num_slots).unsqueeze(0)
+    block_ = torch.block_diag(*[torch.ones(num_slots, num_slots) for _ in range(batch_length)]).unsqueeze(0)
+    mask = torch.max(sparse_, block_).bool().to(seq.device)
+    return mask
+
+
+def get_causal_sparse_mask_with_batch_length(batch_length, num_slots, device):
+    ''' For masking out the subsequent info w/ block. '''
+    def create_sparse_mask(batch_length, num_slots):
+        tensor = torch.zeros(batch_length*num_slots, batch_length*num_slots, dtype=torch.int)
+        for i in range(1, batch_length+1):
+            tensor = torch.diagonal_scatter(tensor, torch.ones((batch_length-i)*num_slots), offset=-num_slots*i)
+        return tensor
+
+    sparse_ = create_sparse_mask(batch_length, num_slots).unsqueeze(0)
+    block_ = torch.block_diag(*[torch.ones(num_slots, num_slots) for _ in range(batch_length)]).unsqueeze(0)
+    mask = torch.max(sparse_, block_).bool().to(device)
+    return mask
+
+
 def get_vector_mask(batch_length, device):
     mask = torch.ones((1, 1, batch_length), device=device).bool()
     # mask = torch.ones((1, batch_length, 1), device=device).bool()
