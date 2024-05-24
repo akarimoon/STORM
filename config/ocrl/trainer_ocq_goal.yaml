@@ -1,0 +1,111 @@
+defaults:
+  - env_config: target-N4C4S3S1
+  - _self_
+
+wandb:
+  mode: online
+  project: STORM-OCRL
+  entity: null
+  name: null
+  # group: slate_video_agent
+  group: target
+  tags: null
+  notes: null
+
+initialization:
+  resume_ckpt: null
+  pretrained_ckpt: null # ocrl_slate_vq_pretrained.pth
+
+common:
+  max_steps: 102000
+  seed: 0
+  image_size: 64
+  device: cuda:0
+  resume: False
+  load_pretrained: False
+
+envs:
+  env_type: ocrl
+  env_name: target-N4C4S3S1
+  num_envs: 1
+  max_step: 50
+
+replay_buffer:
+  _target_: replay_buffer.OCRLReplayBuffer
+  max_episodes: 10000
+  max_length: 50
+  warmup_length: 1024
+  store_on_gpu: True
+
+training:
+  batch_size: 16
+  demonstration_batch_size: 0
+  batch_length: 8
+  imagine_batch_size: 32 # 1024
+  imagine_demonstration_batch_size: 0
+  imagine_context_length: 4
+  imagine_batch_length: 20
+  train_dynamics_every_steps: 1
+  train_agent_every_steps: 1
+  use_demonstration: False
+  trajectory_path: null
+  #############################
+  save_every_steps: 2500
+  vis_every_steps: 1000
+  inspect_every_steps: 1000
+  inspect_batch_size: 16
+  inspect_context_length: 4
+  inspect_batch_length: 8
+
+evaluation:
+  max_step: 2048
+  num_episodes: 100
+
+world_model:
+  _target_: sub_models.ocq_world_models.OCQuantizedWorldModel
+  lr_vae: 0.0003
+  lr_sa: 0.0001
+  lr_dec: 0.0001
+  lr_tf: 0.0001
+  lr_rt: 0.0001
+  max_grad_norm_vae: 10.0
+  max_grad_norm_sa: 0.05
+  max_grad_norm_dec: 0.05
+  max_grad_norm_tf: 1000.0
+  max_grad_norm_rt: 1000.0
+  in_channels: 3
+  stem_channels: 64
+  stoch_num_classes: 256
+  stoch_dim: 64
+  num_slots: 7
+  slot_dim: 192
+  dec_hidden_dim: 512
+  dec_num_layers: 2
+  vocab_size: 64
+  transformer_hidden_dim: 512
+  transformer_num_layers: 2
+  transformer_num_heads: 8
+  transformer_max_length: 64
+  emb_type: 2emb
+  skip_connection: True
+  stochastic_slots: False
+  post_type: mlp
+  mask_type: block
+  loss_type: slate
+  agent_state_type: both
+  coef_anneal_steps: -1
+  vis_attn_type: sbd
+  imagine_with: latent
+  sbd_target: onehot
+
+agent:
+  _target_: agents.OCActorCriticAgent
+  num_heads: 8
+  num_layers: 1
+  hidden_dim: 128
+  mlp_hidden_dim: 64
+  gamma: 0.985
+  lambd: 0.95
+  entropy_coef: 3.0e-4
+  lr: 3.0e-4 # 5.0e-5
+  max_grad_norm: 0.2
