@@ -290,6 +290,38 @@ class OCPositionalEncoding1D2Emb(nn.Module):
         return feat
     
 
+class OCRepeatedPositionalEncoding1D(nn.Module):
+    def __init__(
+        self,
+        max_length: int,
+        num_slots: int,
+        embed_dim: int
+    ):
+        super().__init__()
+        self.max_length = max_length
+        self.num_slots = num_slots
+        self.embed_dim = embed_dim
+
+        self.pos_emb = nn.Embedding(self.max_length, embed_dim)
+
+    def forward(self, feat):
+        pos_emb = self.pos_emb(torch.tensor([[t] * self.num_slots for t in range(self.max_length)], device=feat.device).flatten(0, 1))
+        pos_emb = repeat(pos_emb, "LN D -> B LN D", B=feat.shape[0])
+
+
+        feat = rearrange(feat, "B L N D -> B (L N) D")
+        feat = feat + pos_emb[:, :feat.shape[1], :]
+        return feat
+
+    def forward_with_position(self, feat, position):
+        pos_emb = self.pos_emb(torch.tensor([[t] * self.num_slots for t in range(self.max_length)], device=feat.device).flatten(0, 1))
+        pos_emb = repeat(pos_emb, "LN D -> B LN D", B=feat.shape[0])
+
+        feat = rearrange(feat, "B L N D -> B (L N) D")
+        feat = feat + pos_emb[:, position:position+self.num_slots, :]
+        return feat
+    
+
 class PositionalEncoding2D(nn.Module):
     def __init__(self, resolution, channels):
         super().__init__()

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from einops import repeat, rearrange
 
 from sub_models.attention_blocks import get_vector_mask
-from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache, OCPositionalEncoding1D, OCPositionalEncoding1D2Emb
+from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache, OCPositionalEncoding1D, OCPositionalEncoding1D2Emb, OCRepeatedPositionalEncoding1D
 
 
 class StochasticTransformer(nn.Module):
@@ -123,6 +123,8 @@ class OCStochasticTransformerKVCache(nn.Module):
             self.position_encoding = OCPositionalEncoding1D(max_length=max_length, num_slots=num_slots, embed_dim=feat_dim)
         elif emb_type == '2emb':
             self.position_encoding = OCPositionalEncoding1D2Emb(max_length=max_length, num_slots=num_slots, embed_dim=feat_dim)
+        elif emb_type == '1emb_repeat':
+            self.position_encoding = OCRepeatedPositionalEncoding1D(max_length=max_length, num_slots=num_slots, embed_dim=feat_dim)
         self.layer_stack = nn.ModuleList([
             AttentionBlockKVCache(feat_dim=feat_dim, hidden_dim=feat_dim*2, num_heads=num_heads, dropout=dropout) for _ in range(num_layers)
         ])
