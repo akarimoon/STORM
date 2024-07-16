@@ -586,7 +586,7 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 class OCQuantizedWorldModel(nn.Module):
     def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, num_slots, slot_dim, dec_hidden_dim, dec_num_layers, vocab_size, sbd_target,
                  transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, emb_type, skip_connection, stochastic_slots,
-                 post_type, mask_type, loss_type, agent_state_type, vis_attn_type, imagine_with,
+                 post_type, mask_type, loss_config, agent_state_type, vis_attn_type, imagine_with,
                  lr_vae, lr_sa, lr_dec, lr_tf, lr_rt, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, max_grad_norm_tf, max_grad_norm_rt,
                  coef_anneal_steps) -> None:
         super().__init__()
@@ -601,7 +601,7 @@ class OCQuantizedWorldModel(nn.Module):
         self.transformer_hidden_dim = transformer_hidden_dim
         self.stochastic_slots = stochastic_slots
         self.mask_type = mask_type
-        self.loss_type = loss_type
+        self.loss_config = loss_config
         self.vis_attn_type = vis_attn_type
         self.agent_state_type = agent_state_type
         self.imagine_with = imagine_with
@@ -1084,73 +1084,103 @@ class OCQuantizedWorldModel(nn.Module):
             prior_logits = rearrange(prior_logits, "(B L) K C -> B L K C", B=batch_size)
             recon_logits = rearrange(recon_logits, "(B L) K C -> B L K C", B=batch_size)
 
-            total_loss = reconstruction_loss + coef_ * (reward_loss + termination_loss)
-
-            if self.loss_type == "slate": # ce loss
+            total_loss = reconstruction_loss + coef_ * (reward_loss + termination_loss)*0.1
+            
+            ce_loss = 0.
+            if self.loss_config.ce_type == "ce":
                 ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
-                total_loss = reconstruction_loss + coef_ * (ce_loss + reward_loss + termination_loss)
-            elif self.loss_type == "slate-storm": # "dyn-rep"-like ce loss
+            elif self.loss_config.ce_type == "storm": # "dyn-rep"-like ce loss
                 ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
                 ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
                 ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-                total_loss = reconstruction_loss + coef_ * (ce_loss + reward_loss + termination_loss)
-            elif self.loss_type == "slate-zrecon": # ce loss
-                if self.sbd_target == 'onehot':
-                    ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
-                    ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-                elif self.sbd_target == 'soft':
-                    prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    ce_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:])
-                    ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
-                total_loss = reconstruction_loss + coef_ * (ce_loss + ce_recon_loss + reward_loss + termination_loss)
-            elif self.loss_type == "slate-zrecon-storm": # ce loss
-                if self.sbd_target == 'onehot':
-                    ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
-                    ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
-                    ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-                    ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-                elif self.sbd_target == 'soft':
-                    prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    ce_dyn_loss = self.mse_loss_func(prior_logits[:, :-1].detach(), soft[:, 1:])
-                    ce_rep_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:].detach())
-                    ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-                    ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
-                total_loss = reconstruction_loss + ce_loss + ce_recon_loss + reward_loss + termination_loss
+            elif self.loss_config.ce_type == "mse":
+                assert self.sbd_target == 'soft', "ce_type 'mse' is only available for soft target"
+                prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+                # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+                ce_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:])
+            total_loss += coef_ * ce_loss
 
-            elif self.loss_type == "slate-zrecon-recon": # ce loss
+            if self.loss_config.recon_z:
+                if self.loss_config.ce_type == "ce" or self.loss_config.ce_type == "storm":
+                    ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
+                elif self.loss_config.ce_type == "mse":
+                    assert self.sbd_target == 'soft', "ce_type 'mse' is only available for soft target"
+                    recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+                    ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
+                total_loss += coef_ * ce_recon_loss
+
+            if self.loss_config.recon_x_from_slots:
+                obs_hat_from_recon = self.image_decoder(recon_sample)
                 obs_hat_from_prior = self.image_decoder(prior_sample)
-                obs_hat_from_recon = self.image_decoder(recon_sample)
-                recon_from_slots_loss = self.mse_loss_func(obs_hat_from_prior, obs) + self.mse_loss_func(obs_hat_from_recon, obs)
+                recon_curr_loss = self.mse_loss_func(obs_hat_from_recon, obs)
+                recon_next_loss = self.mse_loss_func(obs_hat_from_prior[:, :-1], obs[:, 1:])
+                total_loss += coef_ * (recon_curr_loss + recon_next_loss)
 
-                if self.sbd_target == 'onehot':
-                    ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
-                    ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-                elif self.sbd_target == 'soft':
-                    prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    ce_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:])
-                    ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
+            # if self.loss_type == "slate": # ce loss
+            #     ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
+            #     total_loss = reconstruction_loss + coef_ * (ce_loss + reward_loss + termination_loss)
+            # elif self.loss_type == "slate-storm": # "dyn-rep"-like ce loss
+            #     ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
+            #     ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
+            #     ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
+            #     total_loss = reconstruction_loss + coef_ * (ce_loss + reward_loss + termination_loss)
+            # elif self.loss_type == "slate-zrecon": # ce loss
+            #     if self.sbd_target == 'onehot':
+            #         ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
+            #         ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
+            #     elif self.sbd_target == 'soft':
+            #         prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         ce_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:])
+            #         ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
+            #     total_loss = reconstruction_loss + coef_ * (ce_loss + ce_recon_loss + reward_loss + termination_loss)
+            # elif self.loss_type == "slate-zrecon-storm": # ce loss
+            #     if self.sbd_target == 'onehot':
+            #         ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
+            #         ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
+            #         ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
+            #         ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
+            #     elif self.sbd_target == 'soft':
+            #         prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         ce_dyn_loss = self.mse_loss_func(prior_logits[:, :-1].detach(), soft[:, 1:])
+            #         ce_rep_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:].detach())
+            #         ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
+            #         ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
+            #     total_loss = reconstruction_loss + ce_loss + ce_recon_loss + reward_loss + termination_loss
 
-                total_loss = reconstruction_loss + ce_loss + ce_recon_loss + recon_from_slots_loss + reward_loss + termination_loss
+            # elif self.loss_type == "slate-zrecon-recon": # ce loss
+            #     obs_hat_from_prior = self.image_decoder(prior_sample)
+            #     obs_hat_from_recon = self.image_decoder(recon_sample)
+            #     recon_from_slots_loss = self.mse_loss_func(obs_hat_from_prior, obs) + self.mse_loss_func(obs_hat_from_recon, obs)
 
-            elif self.loss_type == "slate-zrecon-recon-storm": # ce loss #TODO: fix this
-                obs_hat_from_recon = self.image_decoder(recon_sample)
+            #     if self.sbd_target == 'onehot':
+            #         ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
+            #         ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
+            #     elif self.sbd_target == 'soft':
+            #         prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            #         ce_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:])
+            #         ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
+
+            #     total_loss = reconstruction_loss + ce_loss + ce_recon_loss + recon_from_slots_loss + reward_loss + termination_loss
+
+            # elif self.loss_type == "slate-zrecon-recon-storm": # ce loss #TODO: fix this
+            #     obs_hat_from_recon = self.image_decoder(recon_sample)
     
-                ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
-                ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
-                ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-                ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-                recon_from_slots_loss = self.mse_loss_func(obs_hat_from_recon, obs)
-                total_loss = reconstruction_loss + ce_loss + reward_loss + termination_loss + ce_recon_loss + recon_from_slots_loss
-            elif self.loss_type == "storm": # dyn-rep loss
-                dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
-                representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
-                total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
+            #     ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
+            #     ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
+            #     ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
+            #     ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
+            #     recon_from_slots_loss = self.mse_loss_func(obs_hat_from_recon, obs)
+            #     total_loss = reconstruction_loss + ce_loss + reward_loss + termination_loss + ce_recon_loss + recon_from_slots_loss
+            # elif self.loss_type == "storm": # dyn-rep loss
+            #     dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
+            #     representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
+            #     total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
             
             if self.stochastic_slots:
                 # kl_loss = self.kl_loss_func(prior_mu, prior_sigma, post_mu, post_sigma)
@@ -1230,36 +1260,17 @@ class OCQuantizedWorldModel(nn.Module):
             "tokens/token_usage_prior": len(torch.unique(prior_tokens)) / self.dist_head.quantizer.codebook_size,
             "tokens/token_hist": wandb.Histogram(tokens.cpu().numpy().flatten()),
         }
-        if self.loss_type == "slate":
+
+        logs.update({
+            "world_model/ce_loss": ce_loss.item(),
+        })
+        if self.loss_config.recon_z:
             logs.update({
-                "world_model/ce_loss": ce_loss.item(),
-            })
-        elif self.loss_type == "slate-storm":
-            logs.update({
-                "world_model/ce_loss": ce_loss.item(),
-            })
-        elif self.loss_type == "slate-zrecon":
-            logs.update({
-                "world_model/ce_loss": ce_loss.item(),
                 "world_model/ce_recon_loss": ce_recon_loss.item(),
             })
-        elif self.loss_type == "slate-zrecon-storm":
+        if self.loss_config.recon_x_from_slots:
             logs.update({
-                "world_model/ce_loss": ce_loss.item(),
-                "world_model/ce_recon_loss": ce_recon_loss.item(),
-            })
-        elif self.loss_type == "slate-zrecon-recon-storm":
-            logs.update({
-                "world_model/ce_loss": ce_loss.item(),
-                "world_model/ce_recon_loss": ce_recon_loss.item(),
-                "world_model/reconstruction_from_slots_loss": recon_from_slots_loss.item(),
-            })
-        elif self.loss_type == "storm":
-            logs.update({
-                "world_model/dynamics_loss": dynamics_loss.item(),
-                "world_model/dynamics_real_kl_div": dynamics_real_kl_div.item(),
-                "world_model/representation_loss": representation_loss.item(),
-                "world_model/representation_real_kl_div": representation_real_kl_div.item(),
+                "world_model/reconstruction_from_slots_loss": (recon_curr_loss + recon_next_loss).item(),
             })
         
         if self.stochastic_slots:

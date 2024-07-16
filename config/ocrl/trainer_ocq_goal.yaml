@@ -87,16 +87,19 @@ world_model:
   transformer_num_heads: 8
   transformer_max_length: 64
   emb_type: 2emb
-  skip_connection: True
+  skip_connection: False
   stochastic_slots: False
   post_type: mlp
   mask_type: block
-  loss_type: slate
   agent_state_type: both
   coef_anneal_steps: -1
   vis_attn_type: sbd
   imagine_with: latent
   sbd_target: onehot
+  loss_config:
+    ce_type: ce # [ce, storm, mse]
+    recon_z: True
+    recon_x_from_slots: False
 
 agent:
   _target_: agents.OCActorCriticAgent
