@@ -131,23 +131,28 @@ class Trainer:
         for _ in tqdm(range(self.cfg.common.max_steps//self.num_envs)):
             context_obs, context_action, sum_reward, current_obs, current_info = self.collect(context_obs, context_action, sum_reward, current_obs, current_info)
 
+            to_log = []
             if self.replay_buffer.ready():
                 if self.total_steps % (self.cfg.training.train_dynamics_every_steps//self.num_envs) == 0:
-                    self.train_world_model()
+                    to_log += self.train_world_model()
 
                 if self.total_steps % (self.cfg.training.train_agent_every_steps//self.num_envs) == 0 and self.total_steps*self.num_envs >= 0:
-                    self.train_agent()
+                    to_log += self.train_agent()
 
                 if self.total_steps % (self.cfg.training.save_every_steps//self.num_envs) == 0:
                     self.save()
 
                 if self.total_steps % (self.cfg.training.inspect_every_steps//self.num_envs) == 0:
-                    self.inspect_reconstruction()
-                    self.inspect_world_model()
+                    to_log += self.inspect_reconstruction()
+                    to_log += self.inspect_world_model()
 
-                    self.eval()
+                    to_log += self.eval()
 
+            for logs in to_log:
+                self.log(logs)
             self.total_steps += 1
+        
+        wandb.finish()
 
     @torch.no_grad()
     def collect(self, context_obs, context_action, sum_reward, current_obs, current_info):
@@ -206,29 +211,34 @@ class Trainer:
                     context_obs = deque(maxlen=16)
                     context_action = deque(maxlen=16)
 
-        if self.replay_buffer.ready():
-             wandb.log({"step": self.total_steps//self.num_envs, "duration/collect": time.time()-start_time})
+        # if self.replay_buffer.ready():
+        #      wandb.log({"step": self.total_steps//self.num_envs, "duration/collect": time.time()-start_time})
 
         return context_obs, context_action, sum_reward, current_obs, current_info
     
     def train_world_model(self) -> None:
         start_time = time.time()
 
-        obs, action, reward, termination = self.replay_buffer.sample(self.cfg.training.batch_size, self.cfg.training.demonstration_batch_size, self.cfg.training.batch_length)
+        obs, action, reward, termination = self.replay_buffer.sample(self.cfg.training.batch_size, self.cfg.training.demonstration_batch_size, self.cfg.training.batch_length,
+            sample_from_start=True)
         logs, video = self.world_model.update(obs, action, reward, termination)
         logs["duration/train_wm"] = time.time() - start_time
 
-        self.log(logs)
+        # self.log(logs)
         if self.total_steps % (self.cfg.training.save_every_steps//self.num_envs) == 0: # only save video once in a while
             if video.shape[2] >= 3:
-                wandb.log({"step": self.total_steps//self.num_envs, "video/reconstruction_slots": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+                # wandb.log({"step": self.total_steps//self.num_envs, "video/reconstruction_slots": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+                logs["video/reconstruction_slots"] = wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)
             else:
-                wandb.log({"step": self.total_steps//self.num_envs, "video/reconstruction": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+                # wandb.log({"step": self.total_steps//self.num_envs, "video/reconstruction": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+                logs["video/reconstruction"] = wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)
 
         if self.total_steps % (self.cfg.training.vis_every_steps//self.num_envs) == 0: # save img in media_dir
             rand_idx = np.random.randint(video.shape[0])
             full_plot = rearrange(torch.tensor(video[rand_idx]).float().div(255.).permute(1, 0, 2, 3, 4), 'N L C H W -> (N L) C H W')
             save_image(full_plot, self.media_dir / f"reconstruction_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
+
+        return [logs]
 
     def train_agent(self) -> None:
         self.world_model.eval()
@@ -237,7 +247,8 @@ class Trainer:
         start_time = time.time()
         with torch.no_grad():
             sample_obs, sample_action, sample_reward, sample_termination = self.replay_buffer.sample(
-                self.cfg.training.imagine_batch_size, self.cfg.training.imagine_demonstration_batch_size, self.cfg.training.imagine_context_length)
+                self.cfg.training.imagine_batch_size, self.cfg.training.imagine_demonstration_batch_size, self.cfg.training.imagine_context_length,
+                sample_from_start=False)
             imagine_latent, agent_action, imagine_reward, imagine_termination, video = self.world_model.imagine_data(
                 self.agent, sample_obs, sample_action,
                 imagine_batch_size=self.cfg.training.imagine_batch_size+self.cfg.training.imagine_demonstration_batch_size,
@@ -258,14 +269,18 @@ class Trainer:
         logs["duration/imagination"] = imagine_time
         logs["duration/train_agent"] = time.time() - start_time
 
-        self.log(logs)
+        # self.log(logs)
+        logs = {}
         if self.total_steps % (self.cfg.training.save_every_steps//self.num_envs) == 0: # only save video once in a while
-            wandb.log({"step": self.total_steps//self.num_envs, "video/rollout": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+            # wandb.log({"step": self.total_steps//self.num_envs, "video/rollout": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+            logs["video/rollout"] = wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)
 
         if self.total_steps % (self.cfg.training.vis_every_steps//self.num_envs) == 0: # save img in media_dir
             rand_idx = np.random.randint(video.shape[0])
             full_plot = rearrange(torch.tensor(video[rand_idx]).float().div(255.).permute(1, 0, 2, 3, 4), 'N L C H W -> (N L) C H W')
             save_image(full_plot, self.media_dir / f"rollout_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
+
+        return [logs]
 
     @torch.no_grad()
     def eval(self) -> None:
@@ -304,7 +319,7 @@ class Trainer:
 
                 rewards += reward
             all_rewards.append(rewards)
-        wandb.log({"step": self.total_steps//self.num_envs, "eval/mean_reward": np.mean(all_rewards), "eval/std_reward": np.std(all_rewards)})
+        return [{"eval/mean_reward": np.mean(all_rewards), "eval/std_reward": np.std(all_rewards)}]
 
     @torch.no_grad()
     def inspect_reconstruction(self) -> None:
@@ -314,12 +329,15 @@ class Trainer:
                 self.cfg.training.imagine_batch_size, self.cfg.training.imagine_demonstration_batch_size, self.cfg.training.imagine_context_length)
             video = self.world_model.inspect_reconstruction(sample_obs, tau=0.1)
 
+        logs = {}
         if video.shape[2] >= 3:
-            wandb.log({"step": self.total_steps//self.num_envs, "video/reconstruction_using_hard": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+            logs = {"video/reconstruction_using_hard": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)}
 
         rand_idx = np.random.randint(video.shape[0])
         full_plot = rearrange(torch.tensor(video[rand_idx]).float().div(255.).permute(1, 0, 2, 3, 4), 'N L C H W -> (N L) C H W')
         save_image(full_plot, self.media_dir / f"reconstruction_inspect_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
+
+        return [logs]
 
     @torch.no_grad()
     def inspect_world_model(self) -> None:
@@ -337,14 +355,17 @@ class Trainer:
                 imagine_batch_length=self.cfg.training.inspect_batch_length,
             )
 
+        logs = {}
         if video.shape[2] >= 3:
-            wandb.log({"step": self.total_steps//self.num_envs, "video/rollout_slots_with_gt": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+            logs = {"video/rollout_slots_with_gt": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)}
         else:
-            wandb.log({"step": self.total_steps//self.num_envs, "video/rollout_with_gt": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
+            logs = {"video/rollout_with_gt": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)}
 
         rand_idx = np.random.randint(video.shape[0])
         full_plot = rearrange(torch.tensor(video[rand_idx]).float().div(255.).permute(1, 0, 2, 3, 4), 'N L C H W -> (N L) C H W')
         save_image(full_plot, self.media_dir / f"rollout_inspect_{self.total_steps//self.num_envs}.png", nrow=video.shape[1])
+
+        return [logs]
 
     @torch.no_grad()
     def save(self) -> None:

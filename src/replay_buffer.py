@@ -178,9 +178,13 @@ class OCRLReplayBuffer():
 
     def ready(self):
         return self.length * self.num_envs > self.warmup_length
+    
+    def pad(self, x, padding_length_left, padding_length_right):
+        pad_right = torch.nn.functional.pad(x, [0 for _ in range(2 * x.ndim - 1)] + [padding_length_right]) if padding_length_right > 0 else x
+        return torch.nn.functional.pad(pad_right, [0 for _ in range(2 * x.ndim - 2)] + [padding_length_left, 0]) if padding_length_left > 0 else pad_right
 
     @torch.no_grad()
-    def sample(self, batch_size, external_batch_size, batch_length, to_device="cuda"):
+    def sample(self, batch_size, external_batch_size, batch_length, sample_from_start=True, to_device="cuda"):
         assert external_batch_size == 0, "OCRLReplayBuffer does not support external buffer"
         num_episodes = self.episode_pointer
 
@@ -189,11 +193,27 @@ class OCRLReplayBuffer():
             if batch_size > 0:
                 indexes = np.random.randint(0, num_episodes, size=batch_size)
                 for id in indexes:
-                    start = np.random.randint(0, self.episode_length_buffer[id]+1-batch_length)
-                    obs.append(self.obs_buffer[id, start:start+batch_length])
-                    action.append(self.action_buffer[id, start:start+batch_length])
-                    reward.append(self.reward_buffer[id, start:start+batch_length])
-                    termination.append(self.termination_buffer[id, start:start+batch_length])
+                    # start = np.random.randint(0, self.episode_length_buffer[id]+1-batch_length)
+                    # obs.append(self.obs_buffer[id, start:start+batch_length])
+                    # action.append(self.action_buffer[id, start:start+batch_length])
+                    # reward.append(self.reward_buffer[id, start:start+batch_length])
+                    # termination.append(self.termination_buffer[id, start:start+batch_length])
+
+                    if sample_from_start:
+                        start = np.random.randint(0, self.episode_length_buffer[id]-1)
+                        stop = start + batch_length
+                    else:
+                        stop = np.random.randint(1, self.episode_length_buffer[id])
+                        start = stop - batch_length
+                    padding_length_right = max(0, stop - self.episode_length_buffer[id])
+                    padding_length_left = max(0, -start)
+                    start = max(0, start)
+                    stop = min(self.episode_length_buffer[id], stop)
+
+                    obs.append(self.pad(self.obs_buffer[id, start:stop], padding_length_left, padding_length_right))
+                    action.append(self.pad(self.action_buffer[id, start:stop], padding_length_left, padding_length_right))
+                    reward.append(self.pad(self.reward_buffer[id, start:stop], padding_length_left, padding_length_right))
+                    termination.append(self.pad(self.termination_buffer[id, start:stop], padding_length_left, padding_length_right))
 
             obs = torch.stack(obs, dim=0).float() / 255
             obs = rearrange(obs, "B T H W C -> B T C H W")
