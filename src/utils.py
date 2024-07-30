@@ -55,57 +55,6 @@ class EMAScalar():
     def get(self):
         return self.scalar
 
-
-# def load_config(config_path):
-#     conf = CN()
-#     # Task need to be RandomSample/TrainVQVAE/TrainWorldModel
-#     conf.Task = ""
-
-#     conf.BasicSettings = CN()
-#     conf.BasicSettings.Seed = 0
-#     conf.BasicSettings.ImageSize = 0
-#     conf.BasicSettings.ReplayBufferOnGPU = False
-
-#     # Under this setting, input 128*128 -> latent 16*16*64
-#     conf.Models = CN()
-
-#     conf.Models.WorldModel = CN()
-#     conf.Models.WorldModel.InChannels = 0
-#     conf.Models.WorldModel.TransformerMaxLength = 0
-#     conf.Models.WorldModel.TransformerHiddenDim = 0
-#     conf.Models.WorldModel.TransformerNumLayers = 0
-#     conf.Models.WorldModel.TransformerNumHeads = 0
-
-#     conf.Models.Agent = CN()
-#     conf.Models.Agent.NumLayers = 0
-#     conf.Models.Agent.HiddenDim = 256
-#     conf.Models.Agent.Gamma = 1.0
-#     conf.Models.Agent.Lambda = 0.0
-#     conf.Models.Agent.EntropyCoef = 0.0
-
-#     conf.JointTrainAgent = CN()
-#     conf.JointTrainAgent.SampleMaxSteps = 0
-#     conf.JointTrainAgent.BufferMaxLength = 0
-#     conf.JointTrainAgent.BufferWarmUp = 0
-#     conf.JointTrainAgent.NumEnvs = 0
-#     conf.JointTrainAgent.BatchSize = 0
-#     conf.JointTrainAgent.DemonstrationBatchSize = 0
-#     conf.JointTrainAgent.BatchLength = 0
-#     conf.JointTrainAgent.ImagineBatchSize = 0
-#     conf.JointTrainAgent.ImagineDemonstrationBatchSize = 0
-#     conf.JointTrainAgent.ImagineContextLength = 0
-#     conf.JointTrainAgent.ImagineBatchLength = 0
-#     conf.JointTrainAgent.TrainDynamicsEverySteps = 0
-#     conf.JointTrainAgent.TrainAgentEverySteps = 0
-#     conf.JointTrainAgent.SaveEverySteps = 0
-#     conf.JointTrainAgent.UseDemonstration = False
-
-#     conf.defrost()
-#     conf.merge_from_file(config_path)
-#     conf.freeze()
-
-#     return conf
-
 def linear_warmup_exp_decay(warmup_steps: Optional[int] = None, exp_decay_rate: Optional[float] = None, exp_decay_steps: Optional[int] = None):
     assert (exp_decay_steps is None) == (exp_decay_rate is None)
     use_exp_decay = exp_decay_rate is not None
@@ -119,3 +68,40 @@ def linear_warmup_exp_decay(warmup_steps: Optional[int] = None, exp_decay_rate: 
             multiplier *= exp_decay_rate ** (step / exp_decay_steps)
         return multiplier
     return lr_lambda
+
+def configure_optimizer(model, learning_rate, weight_decay, *blacklist_module_names):
+    """Credits to https://github.com/karpathy/minGPT"""
+    # separate out all parameters to those that will and won't experience regularizing weight decay
+    decay = set()
+    no_decay = set()
+    whitelist_weight_modules = (torch.nn.Linear, torch.nn.Conv1d)
+    blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+    for mn, m in model.named_modules():
+        for pn, p in m.named_parameters():
+            fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
+            if any([fpn.startswith(module_name) for module_name in blacklist_module_names]):
+                no_decay.add(fpn)
+            elif 'bias' in pn:
+                # all biases will not be decayed
+                no_decay.add(fpn)
+            elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                # weights of whitelist modules will be weight decayed
+                decay.add(fpn)
+            elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                # weights of blacklist modules will NOT be weight decayed
+                no_decay.add(fpn)
+
+    # validate that we considered every parameter
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    inter_params = decay & no_decay
+    union_params = decay | no_decay
+    assert len(inter_params) == 0, f"parameters {str(inter_params)} made it into both decay/no_decay sets!"
+    assert len(param_dict.keys() - union_params) == 0, f"parameters {str(param_dict.keys() - union_params)} were not separated into either decay/no_decay set!"
+
+    # create the pytorch optimizer object
+    optim_groups = [
+        {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
+        {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate)
+    return optimizer
