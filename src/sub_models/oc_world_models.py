@@ -11,7 +11,8 @@ from einops.layers.torch import Rearrange
 from torch.cuda.amp import autocast
 import wandb
 
-from sub_models.functions_losses import SymLogTwoHotLoss
+from sub_models.functions_losses import SymLogTwoHotLoss, MSELoss, CELoss, CategoricalKLDivLossWithFreeBits
+from sub_models.quantizer import OneHotDictionary
 from sub_models.attention_blocks import get_causal_mask_with_batch_length, get_causal_mask, PositionalEncoding1D, PositionalEncoding2D, get_subsequent_mask_with_batch_length, get_subsequent_mask
 from sub_models.transformer_model import OCStochasticTransformerKVCache
 from sub_models.slate_utils import resize_patches_to_image
@@ -372,82 +373,6 @@ class TerminationDecoder(nn.Module):
         termination = self.head(feat)
         termination = termination.squeeze(-1)  # remove last 1 dim
         return termination
-
-
-class OneHotDictionary(nn.Module):
-    def __init__(self, vocab_size, emb_size, enable_reset=False):
-        super().__init__()
-        self.dictionary = nn.Embedding(vocab_size, emb_size)
-        self.vocab_size = vocab_size
-
-        self.usage_count = torch.zeros(vocab_size)
-        self.step_count = 0
-        self._thres = 0.1
-        self.last_seen_x = None
-        self.init_dict = self.dictionary.weight.data.clone()
-        self.dist_from_init = torch.zeros(vocab_size)
-
-        self.enable_reset = enable_reset
-
-    def forward(self, x):
-        """
-        x: B, N, vocab_size
-        """
-
-        tokens = torch.argmax(x, dim=-1)  # batch_size x N
-        token_embs = self.dictionary(tokens)  # batch_size x N x emb_size
-
-        if self.training:
-            self.last_seen_x = rearrange(token_embs, "B K C -> (B K) C")
-            self.usage_count += F.one_hot(tokens, num_classes=self.vocab_size).float().sum(dim=(0,1)).detach().cpu()
-            self.dist_from_init = torch.norm(self.dictionary.weight.data - self.init_dict.to(x.device), dim=-1)
-            self.step_count += 1
-
-            if self.enable_reset and self.step_count % 1000 == 0:
-                self.reset_unused_tokens(x.device)
-
-        return token_embs
-    
-    def reset_unused_tokens(self, device):
-        target_ids = torch.where(self.usage_count / self.step_count < self._thres)[0]
-        most_used_ids = torch.argsort(self.usage_count, descending=True)[1:]
-        rand_ids = torch.tensor(np.random.choice(most_used_ids, len(target_ids), replace=False)).to(device)
-        self.dictionary.weight.data[target_ids] = self.dictionary.weight.data[rand_ids] + torch.randn_like(self.dictionary.weight.data[rand_ids]) / 100
-
-class MSELoss(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, obs_hat, obs):
-        loss = (obs_hat - obs)**2
-        loss = reduce(loss, "B L C H W -> B L", "sum")
-        return loss.mean()
-
-
-class CELoss(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, logits_hat, logits):
-        loss = -(logits * F.log_softmax(logits_hat, dim=-1))
-        loss = reduce(loss, "B L K C -> B L", "sum")
-        return loss.mean()
-
-
-class CategoricalKLDivLossWithFreeBits(nn.Module):
-    def __init__(self, free_bits) -> None:
-        super().__init__()
-        self.free_bits = free_bits
-
-    def forward(self, p_logits, q_logits):
-        p_dist = OneHotCategorical(logits=p_logits)
-        q_dist = OneHotCategorical(logits=q_logits)
-        kl_div = torch.distributions.kl.kl_divergence(p_dist, q_dist)
-        kl_div = reduce(kl_div, "B L D -> B L", "sum")
-        kl_div = kl_div.mean()
-        real_kl_div = kl_div
-        kl_div = torch.max(torch.ones_like(kl_div)*self.free_bits, kl_div)
-        return kl_div, real_kl_div
 
 
 class OCWorldModel(nn.Module):

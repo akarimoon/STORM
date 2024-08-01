@@ -1,7 +1,8 @@
+from einops import reduce
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.distributions import OneHotCategorical, MultivariateNormal
 
 @torch.no_grad()
 def symlog(x):
@@ -53,6 +54,54 @@ class SymLogTwoHotLoss(nn.Module):
 
     def decode(self, output):
         return symexp(F.softmax(output, dim=-1) @ self.bins)
+
+
+class MSELoss(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, obs_hat, obs):
+        loss = (obs_hat - obs)**2
+        loss = reduce(loss, "B L C H W -> B L", "sum")
+        return loss.mean()
+
+
+class CELoss(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, logits_hat, logits):
+        loss = -(logits * F.log_softmax(logits_hat, dim=-1))
+        loss = reduce(loss, "B L K C -> B L", "sum")
+        return loss.mean()
+
+
+class KLLoss(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, prior_mu, prior_sigma, post_mu, post_sigma):
+        p_dist = MultivariateNormal(loc=prior_mu, scale_tril=torch.diag_embed(prior_sigma))
+        q_dist = MultivariateNormal(loc=post_mu, scale_tril=torch.diag_embed(post_sigma))
+        kl_div = torch.distributions.kl.kl_divergence(p_dist, q_dist)
+        kl_div = reduce(kl_div, "B L N -> B L", "sum")
+        return kl_div.mean()
+    
+
+class CategoricalKLDivLossWithFreeBits(nn.Module):
+    def __init__(self, free_bits) -> None:
+        super().__init__()
+        self.free_bits = free_bits
+
+    def forward(self, p_logits, q_logits):
+        p_dist = OneHotCategorical(logits=p_logits)
+        q_dist = OneHotCategorical(logits=q_logits)
+        kl_div = torch.distributions.kl.kl_divergence(p_dist, q_dist)
+        kl_div = reduce(kl_div, "B L D -> B L", "sum")
+        kl_div = kl_div.mean()
+        real_kl_div = kl_div
+        kl_div = torch.max(torch.ones_like(kl_div)*self.free_bits, kl_div)
+        return kl_div, real_kl_div
 
 
 if __name__ == "__main__":

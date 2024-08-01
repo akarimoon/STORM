@@ -38,7 +38,7 @@ replay_buffer:
   store_on_gpu: True
 
 training:
-  batch_size: 16
+  batch_size: 64
   demonstration_batch_size: 0
   batch_length: 8
   imagine_batch_size: 32 # 1024
@@ -68,11 +68,15 @@ world_model:
   lr_dec: 0.0001
   lr_tf: 0.0001
   lr_rt: 0.0001
-  max_grad_norm_vae: 10.0
-  max_grad_norm_sa: 0.05
-  max_grad_norm_dec: 0.05
+  max_grad_norm_vae: 1000.0
+  max_grad_norm_sa: 1000.0
+  max_grad_norm_dec: 1000.0
   max_grad_norm_tf: 1000.0
   max_grad_norm_rt: 1000.0
+  coef_recon: 1.0
+  coef_dyn: 1.0
+  coef_stat: 1.0
+  #############################
   in_channels: 3
   stem_channels: 64
   stoch_num_classes: 256
@@ -92,14 +96,14 @@ world_model:
   post_type: mlp
   mask_type: block
   agent_state_type: both
-  coef_anneal_steps: -1
   vis_attn_type: sbd
   imagine_with: latent
-  sbd_target: onehot
+  sbd_target: z_q # [onehot, soft, z_q]
+  separate_dist_head: False
   loss_config:
-    ce_type: ce # [ce, storm, mse]
+    ce_type: storm # [ce, storm, mse]
     recon_z: True
-    recon_x_from_slots: False
+    recon_x_from_slots: True
 
 agent:
   _target_: agents.OCActorCriticAgent

@@ -11,140 +11,14 @@ from einops.layers.torch import Rearrange
 from torch.cuda.amp import autocast
 import wandb
 
-from sub_models.functions_losses import SymLogTwoHotLoss
+from sub_models.functions_losses import SymLogTwoHotLoss, MSELoss, CELoss, KLLoss, CategoricalKLDivLossWithFreeBits
+from sub_models.quantizer import FSQ
 from sub_models.attention_blocks import PositionalEncoding1D, PositionalEncoding2D
 from sub_models.attention_blocks import get_subsequent_mask_with_batch_length, get_subsequent_mask, get_causal_mask_with_batch_length, get_causal_mask, get_causal_sparse_mask_with_batch_length, get_causal_sparse_mask
 from sub_models.transformer_model import OCStochasticTransformerKVCache
 from sub_models.dynamics_model import OP3PhysicsNetwork
 from sub_models.slate_utils import resize_patches_to_image
-from utils import linear_warmup_exp_decay
-
-
-"""
-Finite Scalar Quantization: VQ-VAE Made Simple - https://arxiv.org/abs/2309.15505
-Code adapted from Jax version in Appendix A.1
-"""
-
-from einops import rearrange, pack, unpack
-from typing import List, Optional
-from torch.cuda.amp import autocast
-
-# helper functions
-def exists(v):
-    return v is not None
-
-def default(*args):
-    for arg in args:
-        if exists(arg):
-            return arg
-    return None
-
-def pack_one(t, pattern):
-    return pack([t], pattern)
-
-def unpack_one(t, ps, pattern):
-    return unpack(t, ps, pattern)[0]
-
-# tensor helpers
-def round_ste(z: torch.Tensor) -> torch.Tensor:
-    """Round with straight through gradients."""
-    zhat = z.round()
-    return z + (zhat - z).detach()
-
-# main class
-class FSQ(nn.Module):
-    def __init__(self, levels: List[int], dim: Optional[int] = None, num_codebooks = 1, 
-                 keep_num_codebooks_dim: Optional[bool] = None, scale: Optional[float] = None):
-        super().__init__()
-        _levels = torch.tensor(levels, dtype=torch.int64)
-        self.register_buffer("_levels", _levels, persistent=False)
-
-        _basis = torch.cumprod(torch.tensor([1] + levels[:-1]), dim=0, dtype=torch.int64)
-        self.register_buffer("_basis", _basis, persistent=False)
-
-        self.scale = scale
-
-        codebook_dim = len(levels)
-        self.codebook_dim = codebook_dim
-
-        effective_codebook_dim = codebook_dim * num_codebooks
-        self.num_codebooks = num_codebooks
-        self.effective_codebook_dim = effective_codebook_dim
-
-        keep_num_codebooks_dim = default(keep_num_codebooks_dim, num_codebooks > 1)
-        assert not (num_codebooks > 1 and not keep_num_codebooks_dim)
-        self.keep_num_codebooks_dim = keep_num_codebooks_dim
-
-        self.dim = default(dim, len(_levels) * num_codebooks)
-
-        has_projections = self.dim != effective_codebook_dim
-        self.project_in = nn.Linear(self.dim, effective_codebook_dim) if has_projections else nn.Identity()
-        self.project_out = nn.Linear(effective_codebook_dim, self.dim) if has_projections else nn.Identity()
-        self.has_projections = has_projections
-
-        self.codebook_size = self._levels.prod().item()
-
-        implicit_codebook = self.indices_to_codes(torch.arange(self.codebook_size), project_out=False)
-        self.register_buffer("implicit_codebook", implicit_codebook, persistent=False)
-
-    def bound(self, z: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
-        """Bound `z`, an array of shape (..., d)."""
-        half_l = (self._levels - 1) * (1 + eps) / 2
-        offset = torch.where(self._levels % 2 == 0, 0.5, 0.0)
-        shift = (offset / half_l).atanh()
-        return (z + shift).tanh() * half_l - offset
-
-    def quantize(self, z: torch.Tensor) -> torch.Tensor:
-        """Quantizes z, returns quantized zhat, same shape as z."""
-        quantized = round_ste(self.bound(z))
-        half_width = self._levels // 2 # Renormalize to [-1, 1].
-        return quantized / half_width
-    
-    def _scale_and_shift(self, zhat_normalized: torch.Tensor) -> torch.Tensor:
-        half_width = self._levels // 2
-        return (zhat_normalized * half_width) + half_width
-    
-    def _scale_and_shift_inverse(self, zhat: torch.Tensor) -> torch.Tensor:
-        half_width = self._levels // 2
-        return (zhat - half_width) / half_width
-    
-    def codes_to_indices(self, zhat: torch.Tensor) -> torch.Tensor:
-        """Converts a `code` to an index in the codebook."""
-        assert zhat.shape[-1] == self.codebook_dim
-        zhat = self._scale_and_shift(zhat)
-        return (zhat * self._basis).sum(dim=-1).to(torch.int64)
-    
-    def indices_to_codes(self, indices: torch.Tensor, project_out=True) -> torch.Tensor:
-        """Inverse of `codes_to_indices`."""
-        is_img_or_video = indices.ndim >= (3 + int(self.keep_num_codebooks_dim))
-
-        indices = rearrange(indices, '... -> ... 1')
-        codes_non_centered = (indices // self._basis) % self._levels
-        codes = self._scale_and_shift_inverse(codes_non_centered)
-
-        if self.keep_num_codebooks_dim:
-            codes = rearrange(codes, '... c d -> ... (c d)')
-
-        if project_out:
-            codes = self.project_out(codes)
-
-        return codes
-
-    @autocast(enabled=False)
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        einstein notation
-        b - batch
-        n - sequence (or flattened spatial dimensions)
-        d - feature dimension
-        c - codebook dim (= # of levels * # of codebooks)
-        """
-        z = self.project_in(z)
-        codes = self.quantize(z)
-        indices = self.codes_to_indices(codes)
-        out = self.project_out(codes)
-
-        return out, codes, indices
+from utils import linear_warmup_exp_decay, configure_optimizer
     
 
 class Conv2dBlock(nn.Module):
@@ -411,26 +285,29 @@ class DistHead(nn.Module):
     '''
     Dist: abbreviation of distribution
     '''
-    def __init__(self, transformer_hidden_dim, dec_hidden_dim, dec_num_layers, stoch_num_classes, stoch_dim, post_type='broadcast') -> None:
+    def __init__(self, transformer_hidden_dim, dec_input_dim, dec_hidden_dim, dec_num_layers, stoch_num_classes, stoch_dim, 
+                 sbd_target, post_type='broadcast') -> None:
         super().__init__()
+        self.dec_input_dim = dec_input_dim
         self.stoch_dim = stoch_dim
+        self.sbd_target = sbd_target
         self.post_type = post_type
         self.quantizer = FSQ(levels=[7, 5, 5, 5, 5], dim=64) # as proposed in the paper
         if post_type == 'mlp':
             self.prior_head = SpatialBroadcastMLPDecoder(
-                dec_input_dim=transformer_hidden_dim,
+                dec_input_dim=dec_input_dim,
                 dec_hidden_layers=[dec_hidden_dim] * dec_num_layers,
                 stoch_num_classes=stoch_num_classes,
-                stoch_dim=stoch_dim
+                stoch_dim=stoch_dim if sbd_target != 'z_q' else self.quantizer.effective_codebook_dim
             )
         elif post_type == 'conv':
             self.prior_head = SpatialBroadcastConvDecoder(
-                dec_input_dim=transformer_hidden_dim,
+                dec_input_dim=dec_input_dim,
                 dec_hidden_layers=[dec_hidden_dim] * dec_num_layers,
                 stoch_num_classes=stoch_num_classes,
-                stoch_dim=stoch_dim
+                stoch_dim=stoch_dim if sbd_target != 'z_q' else self.quantizer.effective_codebook_dim
             )
-        self.prior_input_dim = transformer_hidden_dim
+        self.out = nn.Linear(stoch_dim, self.quantizer.codebook_size, bias=False) if stoch_dim != self.quantizer.codebook_size else nn.Identity()
 
     def forward_post(self, x):
         batch_size = x.shape[0]
@@ -438,6 +315,7 @@ class DistHead(nn.Module):
         x = rearrange(x, "B L C H W -> B L (H W) C")
         out, codes, indices = self.quantizer(x)
         soft = rearrange(out, "B L (H W) C -> B L C H W", H=H, W=W)
+        codes = rearrange(codes, "B L (H W) C -> B L C H W", H=H, W=W)
         hard = F.one_hot(indices, self.quantizer.codebook_size).float() #.detach()
         return soft, codes, hard
 
@@ -445,9 +323,18 @@ class DistHead(nn.Module):
         batch_size = x.shape[0]
         x = rearrange(x, "B L N D -> (B L) N D")
         logits, _, mask_as_image = self.prior_head(x)
-        logits = rearrange(logits, "(B L) K C -> B L K C", B=batch_size)
 
-        return logits, None, mask_as_image
+        if self.sbd_target == 'onehot':
+            logits = self.out(logits)
+            sample = self.quantizer.indices_to_codes(logits.argmax(dim=-1))
+        elif self.sbd_target == 'soft':
+            sample = logits
+        elif self.sbd_target == 'z_q':
+            sample = self.quantizer.project_out(self.quantizer.quantize(logits))
+        logits = rearrange(logits, "(B L) K C -> B L K C", B=batch_size)
+        sample = rearrange(sample, "(B L) K C -> B L K C", B=batch_size)
+        mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
+        return logits, sample, mask_as_image
 
 
 class RewardDecoder(nn.Module):
@@ -494,101 +381,12 @@ class TerminationDecoder(nn.Module):
         return termination
 
 
-class OneHotDictionary(nn.Module):
-    def __init__(self, vocab_size, emb_size, enable_reset=False):
-        super().__init__()
-        self.dictionary = nn.Embedding(vocab_size, emb_size)
-        self.vocab_size = vocab_size
-
-        self.usage_count = torch.zeros(vocab_size)
-        self.step_count = 0
-        self._thres = 0.1
-        self.last_seen_x = None
-        self.init_dict = self.dictionary.weight.data.clone()
-        self.dist_from_init = torch.zeros(vocab_size)
-
-        self.enable_reset = enable_reset
-
-    def forward(self, x):
-        """
-        x: B, N, vocab_size
-        """
-
-        tokens = torch.argmax(x, dim=-1)  # batch_size x N
-        token_embs = self.dictionary(tokens)  # batch_size x N x emb_size
-
-        if self.training:
-            self.last_seen_x = rearrange(token_embs, "B K C -> (B K) C")
-            self.usage_count += F.one_hot(tokens, num_classes=self.vocab_size).float().sum(dim=(0,1)).detach().cpu()
-            self.dist_from_init = torch.norm(self.dictionary.weight.data - self.init_dict.to(x.device), dim=-1)
-            self.step_count += 1
-
-            if self.enable_reset and self.step_count % 1000 == 0:
-                self.reset_unused_tokens(x.device)
-
-        return token_embs
-    
-    def reset_unused_tokens(self, device):
-        target_ids = torch.where(self.usage_count / self.step_count < self._thres)[0]
-        most_used_ids = torch.argsort(self.usage_count, descending=True)[1:]
-        rand_ids = torch.tensor(np.random.choice(most_used_ids, len(target_ids), replace=False)).to(device)
-        self.dictionary.weight.data[target_ids] = self.dictionary.weight.data[rand_ids] + torch.randn_like(self.dictionary.weight.data[rand_ids]) / 100
-
-
-class MSELoss(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, obs_hat, obs):
-        loss = (obs_hat - obs)**2
-        loss = reduce(loss, "B L C H W -> B L", "sum")
-        return loss.mean()
-
-
-class CELoss(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, logits_hat, logits):
-        loss = -(logits * F.log_softmax(logits_hat, dim=-1))
-        loss = reduce(loss, "B L K C -> B L", "sum")
-        return loss.mean()
-
-
-class KLLoss(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, prior_mu, prior_sigma, post_mu, post_sigma):
-        p_dist = MultivariateNormal(loc=prior_mu, scale_tril=torch.diag_embed(prior_sigma))
-        q_dist = MultivariateNormal(loc=post_mu, scale_tril=torch.diag_embed(post_sigma))
-        kl_div = torch.distributions.kl.kl_divergence(p_dist, q_dist)
-        kl_div = reduce(kl_div, "B L N -> B L", "sum")
-        return kl_div.mean()
-
-
-class CategoricalKLDivLossWithFreeBits(nn.Module):
-    def __init__(self, free_bits) -> None:
-        super().__init__()
-        self.free_bits = free_bits
-
-    def forward(self, p_logits, q_logits):
-        p_dist = OneHotCategorical(logits=p_logits)
-        q_dist = OneHotCategorical(logits=q_logits)
-        kl_div = torch.distributions.kl.kl_divergence(p_dist, q_dist)
-        kl_div = reduce(kl_div, "B L D -> B L", "sum")
-        kl_div = kl_div.mean()
-        real_kl_div = kl_div
-        kl_div = torch.max(torch.ones_like(kl_div)*self.free_bits, kl_div)
-        return kl_div, real_kl_div
-
-
 class OCQuantizedWorldModel(nn.Module):
     def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, num_slots, slot_dim, dec_hidden_dim, dec_num_layers, vocab_size, sbd_target,
-                 transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, emb_type, skip_connection, stochastic_slots,
+                 transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, emb_type, skip_connection, stochastic_slots, separate_dist_head,
                  post_type, mask_type, loss_config, agent_state_type, vis_attn_type, imagine_with,
                  lr_vae, lr_sa, lr_dec, lr_tf, lr_rt, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, max_grad_norm_tf, max_grad_norm_rt,
-                 coef_anneal_steps) -> None:
+                 coef_dyn, coef_stat, coef_recon) -> None:
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -600,13 +398,16 @@ class OCQuantizedWorldModel(nn.Module):
         self.sbd_target = sbd_target
         self.transformer_hidden_dim = transformer_hidden_dim
         self.stochastic_slots = stochastic_slots
+        self.separate_dist_head = separate_dist_head
         self.mask_type = mask_type
         self.loss_config = loss_config
         self.vis_attn_type = vis_attn_type
         self.agent_state_type = agent_state_type
         self.imagine_with = imagine_with
         assert imagine_with in ["latent", "hidden"], "imagine_with must be either 'latent' or 'hidden'"
-        self.coef_anneal_steps = coef_anneal_steps
+        self.coef_dyn = coef_dyn
+        self.coef_stat = coef_stat
+        self.coef_recon = coef_recon
 
         self.use_amp = True
         self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
@@ -636,34 +437,27 @@ class OCQuantizedWorldModel(nn.Module):
             emb_type=emb_type,
             skip_connection=skip_connection
         )
-        # self.storm_transformer = OP3PhysicsNetwork(
-        #     stoch_dim=self.slot_dim,
-        #     action_dim=action_dim,
-        #     feat_dim=transformer_hidden_dim,
-        #     num_slots=num_slots,
-        #     num_layers=transformer_num_layers,
-        #     num_heads=transformer_num_heads,
-        #     max_length=transformer_max_length,
-        #     dropout=0.1,
-        #     emb_type=emb_type,
-        #     skip_connection=skip_connection
-        # )
         self.dist_head = DistHead(
-            transformer_hidden_dim=slot_dim,
+            transformer_hidden_dim=transformer_hidden_dim,
+            dec_input_dim=slot_dim,
             dec_hidden_dim=dec_hidden_dim,
             dec_num_layers=dec_num_layers,
             stoch_num_classes=stoch_num_classes,
             stoch_dim=self.stoch_dim,
+            sbd_target=sbd_target,
             post_type=post_type,
         )
-        # self.dist_head2 = DistHead(
-        #     transformer_hidden_dim=slot_dim,
-        #     dec_hidden_dim=dec_hidden_dim,
-        #     dec_num_layers=dec_num_layers,
-        #     stoch_num_classes=stoch_num_classes,
-        #     stoch_dim=self.stoch_dim,
-        #     post_type=post_type
-        # )
+        if separate_dist_head: # use separete dist head for reconstruction
+            self.dist_head2 = DistHead(
+                transformer_hidden_dim=slot_dim,
+                dec_input_dim=slot_dim,
+                dec_hidden_dim=dec_hidden_dim,
+                dec_num_layers=dec_num_layers,
+                stoch_num_classes=stoch_num_classes,
+                stoch_dim=self.stoch_dim,
+                sbd_target=sbd_target,
+                post_type=post_type
+            )
         self.image_decoder = DecoderBN(
             original_in_channels=in_channels,
             stem_channels=stem_channels,
@@ -685,27 +479,13 @@ class OCQuantizedWorldModel(nn.Module):
             PositionalEncoding1D(self.codebook_size, stoch_dim, weight_init="trunc_normal"),
             nn.Dropout(0.1)
         )
-        if self.dist_head.prior_head.stoch_dim != self.codebook_size:
-            # self.out = nn.Linear(stoch_dim, self.codebook_size, bias=False)
-            self.out = nn.Sequential(
-                # nn.Linear(self.dist_head.prior_head.stoch_dim, self.dist_head.prior_head.stoch_dim),
-                # nn.LayerNorm(self.dist_head.prior_head.stoch_dim),
-                # nn.ReLU(inplace=True),
-                nn.Linear(self.dist_head.prior_head.stoch_dim, self.codebook_size)
-            )
-        else:
-            self.out = nn.Identity()
-        if transformer_hidden_dim != self.dist_head.prior_input_dim:
+        if transformer_hidden_dim != slot_dim:
             self.slot_proj = nn.Sequential(
-                # nn.Linear(transformer_hidden_dim, transformer_hidden_dim),
                 nn.LayerNorm(transformer_hidden_dim),
-                # nn.ReLU(inplace=True),
-                nn.Linear(transformer_hidden_dim, self.dist_head.prior_input_dim)
+                nn.Linear(transformer_hidden_dim, slot_dim)
             )
         else:
             self.slot_proj = nn.Identity()
-
-        self.out2 = nn.Linear(self.dist_head.prior_head.stoch_dim, self.dist_head.quantizer.codebook_dim)
 
         if stochastic_slots:
             self.posterior_slots_mu = nn.Linear(slot_dim, slot_dim)
@@ -762,23 +542,22 @@ class OCQuantizedWorldModel(nn.Module):
         )
 
     def _get_dec_params(self):
+        if self.separate_dist_head:
+            return chain(
+            self.dist_head.parameters(),
+            self.pos_embed.parameters(),
+            self.dist_head2.parameters(),
+            )
         return chain(
             self.dist_head.parameters(),
-            self.out.parameters(),
             self.pos_embed.parameters(),
-            # self.dist_head2.parameters(),
         )
 
     def _get_tf_params(self):
-        if self.transformer_hidden_dim != self.slot_dim:
-            return chain(
-                self.storm_transformer.parameters(),
-                self.slot_proj.parameters(),
-            )
-        else:
-            return chain(
-                self.storm_transformer.parameters(),
-            )
+        return chain(
+            self.storm_transformer.parameters(),
+            self.slot_proj.parameters(),
+        )
         
     def _get_rt_params(self):
         return chain(
@@ -796,7 +575,6 @@ class OCQuantizedWorldModel(nn.Module):
         self.dist_head.load_state_dict(extract_state_dict(state_dict, 'dist_head'))
         self.image_decoder.load_state_dict(extract_state_dict(state_dict, 'image_decoder'))
         self.pos_embed.load_state_dict(extract_state_dict(state_dict, 'pos_embed'))
-        self.out.load_state_dict(extract_state_dict(state_dict, 'out'))
 
         # self.slot_attn._reset_slots()
 
@@ -824,33 +602,28 @@ class OCQuantizedWorldModel(nn.Module):
         if not return_attn:
             return slots
         return slots, attns
-    
+
+    def get_mask_with_batch_length(self, batch_length, device):
+        if self.mask_type == "block":
+            mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, device)
+        elif self.mask_type == "subsequent":
+            mask = get_subsequent_mask_with_batch_length(batch_length*self.num_slots, device)
+        elif self.mask_type == "block-sparse":
+            mask = get_causal_sparse_mask_with_batch_length(batch_length, self.num_slots, device)
+        return mask
+
     def calc_last_dist_feat(self, latent, action):
         batch_size, batch_length = latent.shape[:2]
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             slots = self.calc_slots(latent, return_attn=False)
             slots, _, _ = self.sample(slots, dist="posterior")
-            if self.mask_type == "block":
-                temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, latent.device)
-            elif self.mask_type == "subsequent":
-                temporal_mask = get_subsequent_mask_with_batch_length(batch_length*self.num_slots, latent.device)
-            elif self.mask_type == "block-sparse":
-                temporal_mask = get_causal_sparse_mask_with_batch_length(batch_length, self.num_slots, latent.device)
+            temporal_mask = self.get_mask_with_batch_length(batch_length, device=latent.device)
             slots_hat = self.storm_transformer(slots, action, temporal_mask)
             last_slots_hat = slots_hat[:, -1:]
-            last_slots_hat_ = self.slot_proj(last_slots_hat)
-            last_slots_hat_, _, _ = self.sample(last_slots_hat_, dist="prior")
-            prior_logits, _, mask_as_image = self.dist_head.forward_prior(last_slots_hat_)
-            if self.sbd_target == 'onehot':
-                prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
-                prior_logits = self.out(prior_logits)
-                sample = self.dist_head.quantizer.indices_to_codes(prior_logits.argmax(dim=-1))
-                sample = rearrange(sample, "(B L) K C -> B L K C", B=batch_size)
-            elif self.sbd_target == 'soft':
-                prior_logits = self.out2(prior_logits)
-                with torch.no_grad():
-                    sample = self.dist_head.quantizer.project_out(prior_logits)
+            last_slots_hat_proj = self.slot_proj(last_slots_hat)
+            last_slots_hat_proj, _, _ = self.sample(last_slots_hat_proj, dist="prior")
+            prior_logits, sample, mask_as_image = self.dist_head.forward_prior(last_slots_hat_proj)
             pred_slots = self.calc_slots(sample, return_attn=False)
 
         return pred_slots, last_slots_hat
@@ -860,7 +633,7 @@ class OCQuantizedWorldModel(nn.Module):
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             if last_hidden is not None and self.imagine_with == "hidden":
-                slots, attns = self.slot_proj(last_hidden), None
+                slots, attns = self.dist_head.slot_proj(last_hidden), None
             else:
                 slots, attns = self.calc_slots(last_sample)
                 slots, _, _ = self.sample(slots, dist="posterior")
@@ -869,17 +642,7 @@ class OCQuantizedWorldModel(nn.Module):
 
             hidden_hat_proj = self.slot_proj(hidden_hat)
             hidden_hat_proj, _, _ = self.sample(hidden_hat_proj, dist="prior")
-            prior_logits, _, mask_as_image = self.dist_head.forward_prior(hidden_hat_proj)
-            if self.sbd_target == 'onehot':
-                prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
-                prior_logits = self.out(prior_logits)
-                sample = self.dist_head.quantizer.indices_to_codes(prior_logits.argmax(dim=-1))
-                sample = rearrange(sample, "(B L) K C -> B L K C", B=batch_size)
-            elif self.sbd_target == 'soft':
-                # prior_logits = self.out2(prior_logits)
-                # with torch.no_grad():
-                #     sample = self.dist_head.quantizer.project_out(prior_logits)
-                sample = prior_logits
+            prior_logits, sample, mask_as_image = self.dist_head.forward_prior(hidden_hat_proj)
             # sample = self.dist_head.quantizer.indices_to_codes(Categorical(logits=prior_logits).sample())
     
             if log_video:
@@ -896,7 +659,6 @@ class OCQuantizedWorldModel(nn.Module):
             # visualize attn
             H, W = obs_hat.shape[-2:]
             if self.vis_attn_type == "sbd":
-                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
                 obs_hat = torch.clamp(obs_hat, 0, 1)
                 attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
                 # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
@@ -909,12 +671,6 @@ class OCQuantizedWorldModel(nn.Module):
                 # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
 
         return obs_hat, reward_hat, termination_hat, sample, hidden_hat, attns
-
-    def coef_warmup(self, steps):
-        multiplier = 1.0
-        if steps is not None and self.step < steps:
-            multiplier *= self.step / steps
-        return multiplier
     
     def _softplus_to_std(self, softplus):
         softplus = torch.min(softplus, torch.ones_like(softplus)*80)
@@ -956,6 +712,31 @@ class OCQuantizedWorldModel(nn.Module):
             self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
+    def get_ce_loss(self, logits_hat, logits, soft, z_q):
+        if self.sbd_target == "onehot":
+            if self.loss_config.ce_type == "ce":
+                return self.ce_loss(logits_hat, logits)
+            elif self.loss_config.ce_type == "storm": #TODO: recon_logits' STORM loss
+                ce_dyn_loss = self.ce_loss(logits_hat.detach(), logits)
+                ce_rep_loss = self.ce_loss(logits_hat, logits.detach())
+                return 0.5*ce_dyn_loss + 0.1*ce_rep_loss
+        elif self.sbd_target in ["soft", "z_q"]:
+            logits_hat = rearrange(logits_hat, "B L (H W) C -> B L C H W", H=self.final_feature_width)
+            if self.loss_config.ce_type == "mse":
+                if self.sbd_target == "soft":
+                    return self.mse_loss_func(logits_hat, soft)
+                elif self.sbd_target == "z_q":
+                    return self.mse_loss_func(logits_hat, z_q)
+            elif self.loss_config.ce_type == "storm":
+                if self.sbd_target == "soft":
+                    ce_loss_1 = self.mse_loss_func(logits_hat, soft.detach())
+                    ce_loss_2 = self.mse_loss_func(logits_hat.detach(), soft)
+                    return 0.9*ce_loss_1 + 0.1*ce_loss_2
+                elif self.sbd_target == "z_q":
+                    ce_loss_1 = self.mse_loss_func(logits_hat, z_q.detach())
+                    ce_loss_2 = self.mse_loss_func(logits_hat.detach(), z_q)
+                    return 0.9*ce_loss_1 + 0.1*ce_loss_2
+                
     def imagine_data(self, agent, sample_obs, sample_action,
                      imagine_batch_size, imagine_batch_length, log_video=False, logger=None):
         self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=sample_obs.device)
@@ -1021,7 +802,6 @@ class OCQuantizedWorldModel(nn.Module):
         
         batch_size, batch_length = obs.shape[:2]
         H, W = obs.shape[-2:]
-        coef_ = self.coef_warmup(self.coef_anneal_steps)
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):            
             # encoding
@@ -1030,8 +810,6 @@ class OCQuantizedWorldModel(nn.Module):
 
             # slot attention
             codes = rearrange(soft, "B L C H W -> (B L) (H W) C")
-            post_logits = rearrange(post_logits, "B L K C -> (B L) K C")
-            tokens = torch.argmax(post_logits, dim=-1)
             z_emb = self.pos_embed(codes)
             slots, attns = self.slot_attn(z_emb)
             slots = rearrange(slots, "(B L) N D -> B L N D", B=batch_size)
@@ -1041,12 +819,7 @@ class OCQuantizedWorldModel(nn.Module):
             obs_hat = self.image_decoder(soft)
             
             # transformer
-            if self.mask_type == "block":
-                temporal_mask = get_causal_mask_with_batch_length(batch_length, self.num_slots, soft.device)
-            elif self.mask_type == "subsequent":
-                temporal_mask = get_subsequent_mask_with_batch_length(batch_length*self.num_slots, soft.device)
-            elif self.mask_type == "block-sparse":
-                temporal_mask = get_causal_sparse_mask_with_batch_length(batch_length, self.num_slots, soft.device)
+            temporal_mask = self.get_mask_with_batch_length(batch_length, device=soft.device)
             slots_hat = self.storm_transformer(slots, action, temporal_mask) # B L N D
             # decoding reward and termination with slots_hat
             reward_hat = self.reward_decoder(slots_hat)
@@ -1055,132 +828,38 @@ class OCQuantizedWorldModel(nn.Module):
             # slot (slots_hat) space to logits
             slots_hat = self.slot_proj(slots_hat)
             slots_hat, prior_mu, prior_sigma = self.sample(slots_hat, dist="prior")
-            prior_logits, _, mask_as_image = self.dist_head.forward_prior(slots_hat)
-            prior_logits = rearrange(prior_logits, "B L K C -> (B L) K C")
-            if self.sbd_target == 'onehot':
-                prior_logits = self.out(prior_logits)
-                prior_sample = self.dist_head.quantizer.indices_to_codes(prior_logits.argmax(dim=-1))
-            elif self.sbd_target == 'soft':
-                prior_sample = prior_logits
+            prior_logits, prior_sample, mask_as_image = self.dist_head.forward_prior(slots_hat)
 
             # slot (slots) space to logits
-            recon_logits, _, _ = self.dist_head.forward_prior(slots)
-            recon_logits = rearrange(recon_logits, "B L K C -> (B L) K C")
-            if self.sbd_target == 'onehot':
-                recon_logits = self.out(recon_logits)
-                recon_sample = self.dist_head.quantizer.indices_to_codes(recon_logits.argmax(dim=-1))
-            elif self.sbd_target == 'soft':
-                recon_sample = recon_logits
+            if self.separate_dist_head:
+                recon_logits, recon_sample, _ = self.dist_head2.forward_prior(slots)
+            else:
+                recon_logits, recon_sample, _ = self.dist_head.forward_prior(slots)
 
-            prior_sample = rearrange(prior_sample, "(B L) (H W) C -> B L C H W", B=batch_size, H=self.final_feature_width, W=self.final_feature_width)
-            recon_sample = rearrange(recon_sample, "(B L) (H W) C -> B L C H W", B=batch_size, H=self.final_feature_width, W=self.final_feature_width)
+            prior_sample = rearrange(prior_sample, "B L (H W) C -> B L C H W", B=batch_size, H=self.final_feature_width, W=self.final_feature_width)
+            recon_sample = rearrange(recon_sample, "B L (H W) C -> B L C H W", B=batch_size, H=self.final_feature_width, W=self.final_feature_width)
 
+            total_loss = 0.
             # env loss
             reconstruction_loss = self.mse_loss_func(obs_hat, obs)
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
 
-            post_logits = rearrange(post_logits, "(B L) K C -> B L K C", B=batch_size)
-            prior_logits = rearrange(prior_logits, "(B L) K C -> B L K C", B=batch_size)
-            recon_logits = rearrange(recon_logits, "(B L) K C -> B L K C", B=batch_size)
-
-            total_loss = reconstruction_loss + coef_ * (reward_loss + termination_loss)*0.1
+            total_loss += self.coef_recon * reconstruction_loss + self.coef_dyn * (reward_loss + termination_loss)
             
-            ce_loss = 0.
-            if self.loss_config.ce_type == "ce":
-                ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
-            elif self.loss_config.ce_type == "storm": # "dyn-rep"-like ce loss
-                ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
-                ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
-                ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-            elif self.loss_config.ce_type == "mse":
-                assert self.sbd_target == 'soft', "ce_type 'mse' is only available for soft target"
-                prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                ce_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:])
-            total_loss += coef_ * ce_loss
+            ce_loss = self.get_ce_loss(prior_logits[:, :-1], post_logits[:, 1:], soft[:, 1:], z_q[:, 1:])
+            total_loss += self.coef_dyn * ce_loss
 
             if self.loss_config.recon_z:
-                if self.loss_config.ce_type == "ce" or self.loss_config.ce_type == "storm":
-                    ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-                elif self.loss_config.ce_type == "mse":
-                    assert self.sbd_target == 'soft', "ce_type 'mse' is only available for soft target"
-                    recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-                    ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
-                total_loss += coef_ * ce_recon_loss
+                ce_recon_loss = self.get_ce_loss(recon_logits, post_logits, soft, z_q)
+                total_loss += self.coef_stat * ce_recon_loss
 
             if self.loss_config.recon_x_from_slots:
                 obs_hat_from_recon = self.image_decoder(recon_sample)
                 obs_hat_from_prior = self.image_decoder(prior_sample)
                 recon_curr_loss = self.mse_loss_func(obs_hat_from_recon, obs)
                 recon_next_loss = self.mse_loss_func(obs_hat_from_prior[:, :-1], obs[:, 1:])
-                total_loss += coef_ * (recon_curr_loss + recon_next_loss)
-
-            # if self.loss_type == "slate": # ce loss
-            #     ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
-            #     total_loss = reconstruction_loss + coef_ * (ce_loss + reward_loss + termination_loss)
-            # elif self.loss_type == "slate-storm": # "dyn-rep"-like ce loss
-            #     ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
-            #     ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
-            #     ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-            #     total_loss = reconstruction_loss + coef_ * (ce_loss + reward_loss + termination_loss)
-            # elif self.loss_type == "slate-zrecon": # ce loss
-            #     if self.sbd_target == 'onehot':
-            #         ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
-            #         ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-            #     elif self.sbd_target == 'soft':
-            #         prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         ce_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:])
-            #         ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
-            #     total_loss = reconstruction_loss + coef_ * (ce_loss + ce_recon_loss + reward_loss + termination_loss)
-            # elif self.loss_type == "slate-zrecon-storm": # ce loss
-            #     if self.sbd_target == 'onehot':
-            #         ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
-            #         ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
-            #         ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-            #         ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-            #     elif self.sbd_target == 'soft':
-            #         prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         ce_dyn_loss = self.mse_loss_func(prior_logits[:, :-1].detach(), soft[:, 1:])
-            #         ce_rep_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:].detach())
-            #         ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-            #         ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
-            #     total_loss = reconstruction_loss + ce_loss + ce_recon_loss + reward_loss + termination_loss
-
-            # elif self.loss_type == "slate-zrecon-recon": # ce loss
-            #     obs_hat_from_prior = self.image_decoder(prior_sample)
-            #     obs_hat_from_recon = self.image_decoder(recon_sample)
-            #     recon_from_slots_loss = self.mse_loss_func(obs_hat_from_prior, obs) + self.mse_loss_func(obs_hat_from_recon, obs)
-
-            #     if self.sbd_target == 'onehot':
-            #         ce_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:])
-            #         ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-            #     elif self.sbd_target == 'soft':
-            #         prior_logits = rearrange(prior_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         recon_logits = rearrange(recon_logits, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         # z_q = rearrange(z_q, "B L (H W) C -> B L C H W", H=self.final_feature_width)
-            #         ce_loss = self.mse_loss_func(prior_logits[:, :-1], soft[:, 1:])
-            #         ce_recon_loss = self.mse_loss_func(recon_logits, soft.detach())
-
-            #     total_loss = reconstruction_loss + ce_loss + ce_recon_loss + recon_from_slots_loss + reward_loss + termination_loss
-
-            # elif self.loss_type == "slate-zrecon-recon-storm": # ce loss #TODO: fix this
-            #     obs_hat_from_recon = self.image_decoder(recon_sample)
-    
-            #     ce_dyn_loss = self.ce_loss(prior_logits[:, :-1].detach(), post_logits[:, 1:])
-            #     ce_rep_loss = self.ce_loss(prior_logits[:, :-1], post_logits[:, 1:].detach())
-            #     ce_loss = 0.5*ce_dyn_loss + 0.1*ce_rep_loss
-            #     ce_recon_loss = self.ce_loss(recon_logits, post_logits.detach())
-            #     recon_from_slots_loss = self.mse_loss_func(obs_hat_from_recon, obs)
-            #     total_loss = reconstruction_loss + ce_loss + reward_loss + termination_loss + ce_recon_loss + recon_from_slots_loss
-            # elif self.loss_type == "storm": # dyn-rep loss
-            #     dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
-            #     representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
-            #     total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
+                total_loss += self.coef_stat * recon_curr_loss + self.coef_dyn * recon_next_loss
             
             if self.stochastic_slots:
                 # kl_loss = self.kl_loss_func(prior_mu, prior_sigma, post_mu, post_sigma)
@@ -1189,7 +868,6 @@ class OCQuantizedWorldModel(nn.Module):
 
             # visualize attention
             if self.vis_attn_type == "sbd":
-                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
                 obs_hat = torch.clamp(obs_hat, 0, 1)
                 attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
                 # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
@@ -1250,7 +928,9 @@ class OCQuantizedWorldModel(nn.Module):
             "world_model/reward_loss": reward_loss.item(),
             "world_model/termination_loss": termination_loss.item(),
             "world_model/total_loss": total_loss.item(),
-            "world_model/coef": coef_,
+            "world_model/coef_recon": self.coef_recon,
+            "world_model/coef_dyn": self.coef_dyn,
+            "world_model/coef_stat": self.coef_stat,
             "world_model/lr_vae": self.optimizer_vae.param_groups[0]["lr"],
             "world_model/lr_sa": self.optimizer_sa.param_groups[0]["lr"],
             "world_model/lr_dec": self.optimizer_dec.param_groups[0]["lr"],
@@ -1270,7 +950,8 @@ class OCQuantizedWorldModel(nn.Module):
             })
         if self.loss_config.recon_x_from_slots:
             logs.update({
-                "world_model/reconstruction_from_slots_loss": (recon_curr_loss + recon_next_loss).item(),
+                "world_model/reconstruction_from_slots_loss": recon_curr_loss.item(),
+                "world_model/reconstruction_from_next_slots_loss": recon_next_loss.item(),
             })
         
         if self.stochastic_slots:
@@ -1297,23 +978,15 @@ class OCQuantizedWorldModel(nn.Module):
             slots, _, _ = self.sample(slots, dist="posterior")
 
             # slot space to logits
-            pred_logits, _, mask_as_image = self.dist_head.forward_prior(slots)
-            if self.sbd_target == 'onehot':
-                pred_logits = rearrange(pred_logits, "B L K C -> (B L) K C")
-                pred_logits = self.out(pred_logits)
-                sample = self.dist_head.quantizer.indices_to_codes(pred_logits.argmax(dim=-1))
-                sample = rearrange(sample, "(B L) K C -> B L K C", B=batch_size)
-            elif self.sbd_target == 'soft':
-                # pred_logits = self.out2(pred_logits)
-                # with torch.no_grad():
-                #     sample = self.dist_head.quantizer.project_out(pred_logits)
-                sample = pred_logits
+            if self.separate_dist_head:
+                pred_logits, sample, mask_as_image = self.dist_head2.forward_prior(slots)
+            else:
+                pred_logits, sample, mask_as_image = self.dist_head.forward_prior(slots)
             z = rearrange(sample, "B L (H W) C -> B L C H W", B=batch_size, H=self.final_feature_width, W=self.final_feature_width)
             obs_hat = self.image_decoder(z)
 
             # visualize attention
             if self.vis_attn_type == "sbd":
-                mask_as_image = rearrange(mask_as_image, "(B L) N H W -> B L N 1 H W", B=batch_size)
                 obs_hat = torch.clamp(obs_hat, 0, 1)
                 attns = obs_hat.unsqueeze(2).repeat(1, 1, self.num_slots, 1, 1, 1) * mask_as_image #+ 1. - mask_as_image ### color * mask
                 # attns = mask_as_image.repeat(1, 1, 1, 3, 1, 1) ### mask
