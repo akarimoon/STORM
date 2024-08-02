@@ -9,7 +9,6 @@ from einops import rearrange
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-import gymnasium
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,37 +17,12 @@ from tqdm import tqdm
 import wandb
 
 from utils import seed_np_torch
-import env_wrapper
 import envs
+from env_wrapper import build_single_env, build_vec_env
 from agents import ActorCriticAgent
-from sub_models.world_models import WorldModel
+from sub_models.oc_world_models import OCWorldModel
+from sub_models.ocq_world_models import OCQuantizedWorldModel
 from replay_buffer import ReplayBuffer
-
-
-def build_single_atari_env(env_name, image_size, seed):
-    env = gymnasium.make(f"ALE/{env_name}-v5", full_action_space=False, render_mode="rgb_array", frameskip=1)
-    env = env_wrapper.SeedEnvWrapper(env, seed=seed)
-    env = env_wrapper.MaxLast2FrameSkipWrapper(env, skip=4)
-    env = gymnasium.wrappers.ResizeObservation(env, shape=image_size)
-    env = env_wrapper.LifeLossInfo(env)
-    return env
-
-def build_single_ocrl_env(env_config, image_size, seed, max_step=1000):
-    env = getattr(envs, env_config.env)(env_config, seed)
-    env = env_wrapper.OCRLMaxStepWrapper(env, max_step=max_step)
-    return env
-
-def build_vec_env(env_name, env_type, image_size, num_envs, seed, max_step=1000):
-    # lambda pitfall refs to: https://python.plainenglish.io/python-pitfalls-with-variable-capture-dcfc113f39b7
-    def lambda_generator(env_name, image_size):
-        if env_type == "atari":
-            return lambda: build_single_atari_env(env_name, image_size, seed)
-        elif env_type == "ocrl":
-            return lambda: build_single_ocrl_env(env_name, image_size, seed, max_step=max_step)
-    env_fns = []
-    env_fns = [lambda_generator(env_name, image_size) for i in range(num_envs)]
-    vec_env = gymnasium.vector.AsyncVectorEnv(env_fns=env_fns)
-    return vec_env
 
 
 class Trainer:
@@ -83,10 +57,7 @@ class Trainer:
             self.media_dir.mkdir(exist_ok=False, parents=False)
 
         # getting action_dim with dummy env
-        if cfg.envs.env_type == "atari":
-            dummy_env = build_single_atari_env(cfg.envs.env_name, cfg.common.image_size, seed=0)
-        elif cfg.envs.env_type == "ocrl":
-            dummy_env = build_single_ocrl_env(cfg.env_config, cfg.common.image_size, seed=0, max_step=cfg.envs.max_step)
+        dummy_env = build_single_env(cfg.envs, cfg.common.image_size, seed=0)
         action_dim = dummy_env.action_space.n
 
         # build world model and agent
@@ -113,12 +84,7 @@ class Trainer:
 
         # build vec env, not useful in the Atari100k setting
         # but when the max_steps is large, you can use parallel envs to speed up
-        if self.cfg.envs.env_type == "atari":
-            self.vec_env = build_vec_env(self.cfg.envs.env_name, self.cfg.envs.env_type, self.cfg.common.image_size, num_envs=self.num_envs, 
-                                         seed=self.cfg.common.seed)
-        elif self.cfg.envs.env_type == "ocrl":
-            self.vec_env = build_vec_env(self.cfg.env_config, self.cfg.envs.env_type, self.cfg.common.image_size, num_envs=self.num_envs,
-                                        seed=self.cfg.common.seed, max_step=self.cfg.envs.max_step)
+        self.vec_env = build_vec_env(self.cfg.envs, self.cfg.common.image_size, self.num_envs, seed=self.cfg.common.seed)
         print("Current env: " + colorama.Fore.YELLOW + f"{self.cfg.envs.env_name}" + colorama.Style.RESET_ALL)
 
         # reset envs and variables
@@ -256,8 +222,8 @@ class Trainer:
                 log_video=True,
             )
         imagine_time = time.time() - start_time
-        start_time = time.time()
 
+        start_time = time.time()
         logs = self.agent.update(
             latent=imagine_latent,
             action=agent_action,
@@ -266,6 +232,7 @@ class Trainer:
             reward=imagine_reward,
             termination=imagine_termination,
         )
+
         logs["duration/imagination"] = imagine_time
         logs["duration/train_agent"] = time.time() - start_time
 
