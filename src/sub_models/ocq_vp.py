@@ -18,6 +18,7 @@ from sub_models.attention_blocks import get_subsequent_mask_with_batch_length, g
 from sub_models.transformer_model import OCStochasticTransformerKVCache
 from sub_models.dynamics_model import OP3PhysicsNetwork
 from sub_models.slate_utils import resize_patches_to_image
+from sub_models.slotmixer import SlotMixerDecoder
 from utils import linear_warmup_exp_decay
     
 
@@ -182,7 +183,7 @@ class SlotAttention(nn.Module):
 
 
 class SpatialBroadcastMLPDecoder(nn.Module):
-    def __init__(self, dec_input_dim, dec_hidden_layers, stoch_num_classes, stoch_dim, pos_emb_type="2d") -> None:
+    def __init__(self, dec_input_dim, dec_hidden_layers, stoch_num_classes, stoch_dim, pos_emb_type="1d") -> None:
         super().__init__()
 
         self.stoch_dim = stoch_dim
@@ -304,6 +305,15 @@ class DistHead(nn.Module):
             self.prior_head = SpatialBroadcastConvDecoder(
                 dec_input_dim=dec_input_dim,
                 dec_hidden_layers=[dec_hidden_dim] * dec_num_layers,
+                stoch_num_classes=stoch_num_classes,
+                stoch_dim=stoch_dim if sbd_target != 'z_q' else self.quantizer.effective_codebook_dim
+            )
+        elif post_type == 'mixer':
+            self.prior_head = SlotMixerDecoder(
+                dec_input_dim=dec_input_dim,
+                embed_dim=dec_input_dim,
+                dec_hidden_layers=[dec_hidden_dim] * dec_num_layers,
+                renderer_dim=dec_hidden_dim,
                 stoch_num_classes=stoch_num_classes,
                 stoch_dim=stoch_dim if sbd_target != 'z_q' else self.quantizer.effective_codebook_dim
             )
@@ -708,7 +718,8 @@ class OCQuantizedVideoPredictor(nn.Module):
                  transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, emb_type, skip_connection, stochastic_slots, separate_dist_head,
                  post_type, mask_type, loss_config, agent_state_type, vis_attn_type, imagine_with,
                  lr_vae, lr_sa, lr_dec, lr_tf, lr_rt, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, max_grad_norm_tf, max_grad_norm_rt,
-                 coef_dyn, coef_stat, coef_recon) -> None:
+                 coef_dyn, coef_stat, coef_recon,
+                 predict_rt) -> None:
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -734,6 +745,8 @@ class OCQuantizedVideoPredictor(nn.Module):
         self.coef_dyn = coef_dyn
         self.coef_stat = coef_stat
         self.coef_recon = coef_recon
+
+        self.predict_rt = predict_rt # option only in VideoPredictor
 
         self.use_amp = True
         self.tensor_dtype = torch.float16 if self.use_amp else torch.float32
@@ -789,6 +802,18 @@ class OCQuantizedVideoPredictor(nn.Module):
             stem_channels=stem_channels,
             vocab_size=vocab_size
         )
+        if self.predict_rt:
+            self.reward_decoder = RewardDecoder(
+            num_classes=255,
+            embedding_size=self.stoch_flattened_dim,
+            input_dim=transformer_hidden_dim,
+            hidden_dim=transformer_hidden_dim
+            )
+            self.termination_decoder = TerminationDecoder(
+                embedding_size=self.stoch_flattened_dim,
+                input_dim=transformer_hidden_dim,
+                hidden_dim=transformer_hidden_dim
+            )
         self.codebook_size = self.dist_head.quantizer.codebook_size
         self.pos_embed = nn.Sequential(
             PositionalEncoding1D(self.codebook_size, stoch_dim, weight_init="trunc_normal"),
@@ -819,16 +844,20 @@ class OCQuantizedVideoPredictor(nn.Module):
         self.optimizer_sa = torch.optim.Adam(self._get_sa_params(), lr=lr_sa)
         self.optimizer_dec = torch.optim.Adam(self._get_dec_params(), lr=lr_dec)
         self.optimizer_tf = torch.optim.Adam(self._get_tf_params(), lr=lr_tf)
+        if self.predict_rt:
+            self.optimizer_rt = torch.optim.Adam(self._get_rt_params(), lr=lr_rt)
         self.scheduler_vae = None
         self.scheduler_sa = None
         self.scheduler_dec = None
         # self.scheduler_sa = torch.optim.lr_scheduler.LambdaLR(self.optimizer_sa, lr_lambda=linear_warmup_exp_decay(10000, None, None))
         # self.scheduler_dec = torch.optim.lr_scheduler.LambdaLR(self.optimizer_sa, lr_lambda=linear_warmup_exp_decay(10000, None, None))
         self.scheduler_tf = None
+        self.scheduler_rt = None
         self.max_grad_norm_vae = max_grad_norm_vae
         self.max_grad_norm_sa = max_grad_norm_sa
         self.max_grad_norm_dec = max_grad_norm_dec
         self.max_grad_norm_tf = max_grad_norm_tf
+        self.max_grad_norm_rt = max_grad_norm_rt
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
@@ -868,6 +897,12 @@ class OCQuantizedVideoPredictor(nn.Module):
         return chain(
             self.storm_transformer.parameters(),
             self.slot_proj.parameters(),
+        )
+    
+    def _get_rt_params(self):
+        return chain(
+            self.reward_decoder.parameters(),
+            self.termination_decoder.parameters(),
         )
 
     def load(self, path_to_checkpoint, device):
@@ -1062,6 +1097,9 @@ class OCQuantizedVideoPredictor(nn.Module):
             # transformer
             temporal_mask = self.get_mask_with_batch_length(batch_length, device=soft.device)
             slots_hat = self.storm_transformer(slots, action, temporal_mask) # B L N D
+            if self.predict_rt:
+                reward_hat = self.reward_decoder(slots_hat)
+                termination_hat = self.termination_decoder(slots_hat)
 
             # slot (slots_hat) space to logits
             slots_hat = self.slot_proj(slots_hat)
@@ -1081,6 +1119,11 @@ class OCQuantizedVideoPredictor(nn.Module):
             # env loss
             reconstruction_loss = self.mse_loss_func(obs_hat, obs)
             total_loss += self.coef_recon * reconstruction_loss
+
+            if self.predict_rt:
+                reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
+                termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
+                total_loss += self.coef_dyn * (reward_loss + termination_loss)
             
             ce_loss = self.get_ce_loss(prior_logits[:, :-1], post_logits[:, 1:], soft[:, 1:], z_q[:, 1:])
             total_loss += self.coef_dyn * ce_loss
@@ -1122,15 +1165,21 @@ class OCQuantizedVideoPredictor(nn.Module):
         self.scaler.unscale_(self.optimizer_sa)  # for clip grad
         self.scaler.unscale_(self.optimizer_dec)  # for clip grad
         self.scaler.unscale_(self.optimizer_tf)  # for clip grad
+        if self.predict_rt:
+            self.scaler.unscale_(self.optimizer_rt) # for clip grad
         norm_vae = torch.nn.utils.clip_grad_norm_(self._get_vae_params(), max_norm=self.max_grad_norm_vae, norm_type="inf")
         norm_sa = torch.nn.utils.clip_grad_norm_(self._get_sa_params(), max_norm=self.max_grad_norm_sa, norm_type="inf")
         norm_dec = torch.nn.utils.clip_grad_norm_(self._get_dec_params(), max_norm=self.max_grad_norm_dec, norm_type="inf")
         norm_tf = torch.nn.utils.clip_grad_norm_(self._get_tf_params(), max_norm=self.max_grad_norm_tf)
+        if self.predict_rt:
+            norm_rt = torch.nn.utils.clip_grad_norm_(self._get_rt_params(), max_norm=self.max_grad_norm_rt)
         # print(norm_vae, norm_sa, norm_dec, norm_tf)
         self.scaler.step(self.optimizer_vae)
         self.scaler.step(self.optimizer_sa)
         self.scaler.step(self.optimizer_dec)
         self.scaler.step(self.optimizer_tf)
+        if self.predict_rt:
+            self.scaler.step(self.optimizer_rt)
         self.scaler.update()
 
         if self.scheduler_vae is not None:
@@ -1141,11 +1190,15 @@ class OCQuantizedVideoPredictor(nn.Module):
             self.scheduler_dec.step()
         if self.scheduler_tf is not None:
             self.scheduler_tf.step()
+        if self.predict_rt and self.scheduler_rt is not None:
+            self.scheduler_rt.step()
             
         self.optimizer_vae.zero_grad(set_to_none=True)
         self.optimizer_sa.zero_grad(set_to_none=True)
         self.optimizer_dec.zero_grad(set_to_none=True)
         self.optimizer_tf.zero_grad(set_to_none=True)
+        if self.predict_rt:
+            self.optimizer_rt.zero_grad(set_to_none=True)
 
         video = torch.cat([obs.unsqueeze(2), obs_hat.unsqueeze(2), attns], dim=2).cpu().detach() # B L N C H W
         video = (video * 255.).numpy().astype(np.uint8)
@@ -1162,7 +1215,7 @@ class OCQuantizedVideoPredictor(nn.Module):
             "world_model/lr_sa": self.optimizer_sa.param_groups[0]["lr"],
             "world_model/lr_dec": self.optimizer_dec.param_groups[0]["lr"],
             "world_model/lr_tf": self.optimizer_tf.param_groups[0]["lr"],
-            "world_model/norm": norm_vae + norm_sa + norm_dec + norm_tf,
+            "world_model/norm": norm_vae + norm_sa + norm_dec + norm_tf if not self.predict_rt else norm_vae + norm_sa + norm_dec + norm_tf + norm_rt,
             "tokens/token_usage": len(torch.unique(tokens)) / self.dist_head.quantizer.codebook_size,
             "tokens/token_usage_prior": len(torch.unique(prior_tokens)) / self.dist_head.quantizer.codebook_size,
             "tokens/token_hist": wandb.Histogram(tokens.cpu().numpy().flatten()),
@@ -1179,6 +1232,11 @@ class OCQuantizedVideoPredictor(nn.Module):
             logs.update({
                 "world_model/reconstruction_from_slots_loss": recon_curr_loss.item(),
                 "world_model/reconstruction_from_next_slots_loss": recon_next_loss.item(),
+            })
+        if self.predict_rt:
+            logs.update({
+                "world_model/reward_loss": reward_loss.item(),
+                "world_model/termination_loss": termination_loss.item(),
             })
         
         if self.stochastic_slots:
