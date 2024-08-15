@@ -237,7 +237,6 @@ class Trainer:
         logs["duration/train_agent"] = time.time() - start_time
 
         # self.log(logs)
-        logs = {}
         if self.total_steps % (self.cfg.training.save_every_steps//self.num_envs) == 0: # only save video once in a while
             # wandb.log({"step": self.total_steps//self.num_envs, "video/rollout": wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)})
             logs["video/rollout"] = wandb.Video(rearrange(video[:4], 'B L N C H W -> L C (B H) (N W)'), fps=4)
@@ -246,7 +245,6 @@ class Trainer:
             rand_idx = np.random.randint(video.shape[0])
             full_plot = rearrange(torch.tensor(video[rand_idx]).float().div(255.).permute(1, 0, 2, 3, 4), 'N L C H W -> (N L) C H W')
             save_image(full_plot, self.media_dir / f"rollout_{self.total_steps//self.num_envs}.png", nrow=video.shape[1], pad_value=1.0)
-
         return [logs]
 
     @torch.no_grad()
@@ -254,8 +252,7 @@ class Trainer:
         self.world_model.eval()
         self.agent.eval()
 
-        self.test_env = build_vec_env(self.cfg.env_config, self.cfg.envs.env_type, self.cfg.common.image_size, num_envs=self.num_envs,
-                                        seed=self.cfg.common.seed, max_step=self.cfg.evaluation.max_step)
+        self.test_env = build_vec_env(self.cfg.envs, self.cfg.common.image_size, self.num_envs, seed=self.cfg.common.seed)
         
         all_rewards = []
         for _ in range(self.cfg.evaluation.num_episodes):
