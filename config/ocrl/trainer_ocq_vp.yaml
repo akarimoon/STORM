@@ -8,7 +8,7 @@ wandb:
   entity: null
   name: null
   # group: slate_video_agent
-  group: target
+  group: slate_video2
   tags: null
   notes: null
 
@@ -63,7 +63,7 @@ evaluation:
   num_episodes: 100
 
 world_model:
-  _target_: sub_models.ocq_world_models.OCQuantizedWorldModel
+  _target_: sub_models.ocq_vp.OCQuantizedVideoPredictor
   lr_vae: 0.0003
   lr_sa: 0.0001
   lr_dec: 0.0001
@@ -105,6 +105,7 @@ world_model:
     ce_type: storm # [ce, storm, mse]
     recon_z: True
     recon_x_from_slots: True
+  predict_rt: False
 
 agent:
   _target_: agents.OCActorCriticAgent
