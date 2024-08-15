@@ -22,7 +22,7 @@ def get_subsequent_mask_with_batch_length(batch_length, device):
 def get_causal_mask(seq):
     ''' For masking out the subsequent info w/ block. '''
     batch_size, batch_length, num_slots = seq.shape[:3]
-    subsequent_ = torch.tril(torch.ones((1, batch_length, batch_length)), diagonal=1)
+    subsequent_ = torch.tril(torch.ones((1, batch_length, batch_length)))
     block_ = torch.block_diag(*[torch.ones(num_slots, num_slots) for _ in range(batch_length)]).unsqueeze(0)
     mask = torch.max(subsequent_, block_).bool().to(seq.device)
     return mask
@@ -30,7 +30,7 @@ def get_causal_mask(seq):
 
 def get_causal_mask_with_batch_length(batch_length, num_slots, device):
     ''' For masking out the subsequent info w/ block. '''
-    subsequent_ = torch.tril(torch.ones((1, batch_length*num_slots, batch_length*num_slots)), diagonal=1)
+    subsequent_ = torch.tril(torch.ones((1, batch_length*num_slots, batch_length*num_slots)))
     block_ = torch.block_diag(*[torch.ones(num_slots, num_slots) for _ in range(batch_length)]).unsqueeze(0)
     mask = torch.max(subsequent_, block_).bool().to(device)
     return mask
@@ -83,7 +83,7 @@ class ScaledDotProductAttention(nn.Module):
         attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
 
         if mask is not None:
-            attn = attn.masked_fill(mask == 0, -6e4)
+            attn = attn.masked_fill(mask == 0, float('-inf'))
 
         attn = self.dropout(F.softmax(attn, dim=-1))
         output = torch.matmul(attn, v)
@@ -221,6 +221,24 @@ class PositionalEncoding1D(nn.Module):
         return feat
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, max_length, embed_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(max_length, embed_dim)
+        self.embedding.weight = self._init_weight(max_length, embed_dim)
+
+    def _init_weight(self, seq_len, d_model):
+        """Sinusoid absolute positional encoding."""
+        inv_freq = 1. / (10000**(torch.arange(0.0, d_model, 2.0) / d_model))
+        pos_seq = torch.arange(seq_len - 1, -1, -1).type_as(inv_freq)
+        sinusoid_inp = torch.outer(pos_seq, inv_freq)
+        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
+        return nn.Parameter(pos_emb, requires_grad=False)
+
+    def forward(self, x):
+        return self.embedding(x)
+
+
 class OCPositionalEncoding1D(nn.Module):
     def __init__(
         self,
@@ -234,6 +252,7 @@ class OCPositionalEncoding1D(nn.Module):
         self.embed_dim = embed_dim
 
         self.pos_emb = nn.Embedding(self.max_length*self.num_slots, embed_dim)
+        # self.pos_emb = SinusoidalPositionalEncoding(self.max_length*self.num_slots, embed_dim)
 
     def forward(self, feat):
         pos_emb = self.pos_emb(torch.arange(self.max_length*self.num_slots, device=feat.device))
@@ -265,6 +284,7 @@ class OCPositionalEncoding1D2Emb(nn.Module):
         self.embed_dim = embed_dim
 
         self.pos_emb = nn.Embedding(self.max_length, embed_dim)
+        # self.pos_emb = SinusoidalPositionalEncoding(self.max_length*self.num_slots, embed_dim)
         self.slot_emb = nn.Embedding(self.num_slots, embed_dim)
 
     def forward(self, feat):
