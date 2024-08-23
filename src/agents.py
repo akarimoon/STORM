@@ -194,7 +194,7 @@ class ActorCriticAgent(nn.Module):
 class TransformerWithCLS(nn.Module):
     def __init__(self, in_features, d_model, num_heads, num_layers, norm_first=False):
         super(TransformerWithCLS, self).__init__()
-        self._linear = nn.Linear(in_features, d_model)
+        self._linear = nn.Linear(in_features, d_model) if in_features > d_model else nn.Identity()
         self._cls_token = nn.Parameter(torch.zeros(d_model))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model, num_heads,
@@ -211,9 +211,8 @@ class TransformerWithCLS(nn.Module):
         state = torch.cat(
             [self._cls_token.repeat(B*L, 1, 1), state], dim=1
         )
-        state = rearrange(state, "B N D -> N B D")
 
-        feats = self._trans(state)[0]
+        feats = self._trans(state)[:, 0]
         feats = rearrange(feats, "(B L) D -> B L D", B=B)
 
         return feats
@@ -243,28 +242,48 @@ class MLP(nn.Module):
 
 
 class OCActorCriticAgent(ActorCriticAgent):
-    def __init__(self, feat_dim, num_heads, num_layers, hidden_dim, mlp_hidden_dim, action_dim, gamma, lambd, entropy_coef,
+    def __init__(self, feat_dim, pool_type, transformer_num_heads, transformer_num_layers, transformer_hidden_dim, 
+                 mlp_num_layers, mlp_hidden_dim, action_dim, gamma, lambd, entropy_coef,
                  lr, max_grad_norm) -> None:
-        super().__init__(feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, lr, max_grad_norm)
+        super().__init__(feat_dim, mlp_num_layers, mlp_hidden_dim, action_dim, gamma, lambd, entropy_coef, lr, max_grad_norm)
 
-        shared_transformer = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
-        # shared_transformer = MLP(feat_dim, hidden_dim)
-        shared_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, mlp_hidden_dim),
+        if pool_type == 'transformer':
+            shared_layer = TransformerWithCLS(feat_dim, transformer_hidden_dim, transformer_num_heads, transformer_num_layers)
+        elif pool_type == 'mlp':
+            shared_layer = MLP(feat_dim, transformer_hidden_dim)
+
+        actor = [
+            nn.Linear(transformer_hidden_dim, mlp_hidden_dim, bias=False),
             nn.LayerNorm(mlp_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
-            nn.LayerNorm(mlp_hidden_dim),
-            nn.ReLU(inplace=True)
-        )
+            nn.ReLU()
+        ]
+        for i in range(mlp_num_layers - 1):
+            actor.extend([
+                nn.Linear(mlp_hidden_dim, mlp_hidden_dim, bias=False),
+                nn.LayerNorm(mlp_hidden_dim),
+                nn.ReLU()
+            ])
         self.actor = nn.Sequential(
-            shared_transformer,
-            shared_mlp,
+            shared_layer,
+            *actor,
             nn.Linear(mlp_hidden_dim, action_dim)
         )
+
+        critic = [
+            nn.Linear(transformer_hidden_dim, mlp_hidden_dim, bias=False),
+            nn.LayerNorm(mlp_hidden_dim),
+            nn.ReLU()
+        ]
+        for i in range(mlp_num_layers - 1):
+            critic.extend([
+                nn.Linear(mlp_hidden_dim, mlp_hidden_dim, bias=False),
+                nn.LayerNorm(mlp_hidden_dim),
+                nn.ReLU()
+            ])
+
         self.critic = nn.Sequential(
-            shared_transformer,
-            shared_mlp,
+            shared_layer,
+            *critic,
             nn.Linear(mlp_hidden_dim, 255)
         )
 

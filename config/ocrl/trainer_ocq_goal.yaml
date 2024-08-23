@@ -42,7 +42,7 @@ training:
   batch_size: 32
   demonstration_batch_size: 0
   batch_length: 16
-  imagine_batch_size: 32 # 1024
+  imagine_batch_size: 128 # 1024
   imagine_demonstration_batch_size: 0
   imagine_context_length: 4
   imagine_batch_length: 20
@@ -108,12 +108,14 @@ world_model:
 
 agent:
   _target_: agents.OCActorCriticAgent
-  num_heads: 8
-  num_layers: 1
-  hidden_dim: 128
+  pool_type: transformer
+  transformer_num_heads: 8
+  transformer_num_layers: 1
+  transformer_hidden_dim: ${world_model.slot_dim}
+  mlp_num_layers: 2
   mlp_hidden_dim: 64
   gamma: 0.985
   lambd: 0.95
-  entropy_coef: 3.0e-4
-  lr: 3.0e-4 # 5.0e-5
+  entropy_coef: 1.0e-3
+  lr: 1.0e-5 # 5.0e-5
   max_grad_norm: 0.2
