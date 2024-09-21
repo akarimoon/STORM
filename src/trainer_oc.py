@@ -65,9 +65,11 @@ class Trainer:
         self.agent = instantiate(cfg.agent, action_dim=action_dim, feat_dim=self.world_model.agent_input_dim).to(self.device)
         
         if cfg.common.load_pretrained:
-            path_to_checkpoint = Path(hydra.utils.get_original_cwd()) / "pretrained" / cfg.initialization.pretrained_ckpt
+            path_to_checkpoint = Path(hydra.utils.get_original_cwd()) / cfg.initialization.pretrained_ckpt
             print(colorama.Fore.MAGENTA + f"loading pretrained model from {path_to_checkpoint}" + colorama.Style.RESET_ALL)
-            self.world_model.load(path_to_checkpoint, self.device)
+            # self.world_model.load(path_to_checkpoint, self.device)
+            state_dict = torch.load(path_to_checkpoint, map_location=self.device)
+            self.world_model.load_state_dict(state_dict)
 
         # build replay buffer
         self.replay_buffer = instantiate(cfg.replay_buffer, obs_shape=(cfg.common.image_size, cfg.common.image_size, 3), num_envs=cfg.envs.num_envs, device=self.device)
@@ -99,10 +101,15 @@ class Trainer:
 
             to_log = []
             if self.replay_buffer.ready():
+                buffer_stats = self.replay_buffer.get_stats()
+                to_log.append(buffer_stats)
+
                 if self.total_steps % (self.cfg.training.train_dynamics_every_steps//self.num_envs) == 0:
+                    # if self.total_steps >= 100000:
                     to_log += self.train_world_model()
 
                 if self.total_steps % (self.cfg.training.train_agent_every_steps//self.num_envs) == 0 and self.total_steps*self.num_envs >= 0:
+                    # if self.total_steps >= 100000:
                     to_log += self.train_agent()
 
                 if self.total_steps % (self.cfg.training.save_every_steps//self.num_envs) == 0:
@@ -145,6 +152,9 @@ class Trainer:
                     greedy=False
                 )
 
+                if random.random() < 0.01:
+                    action = self.vec_env.action_space.sample()
+
             context_obs.append(rearrange(torch.Tensor(current_obs).to(self.device), "B H W C -> B 1 C H W")/255)
             context_action.append(action)
         else:
@@ -183,6 +193,8 @@ class Trainer:
         return context_obs, context_action, sum_reward, current_obs, current_info
     
     def train_world_model(self) -> None:
+        self.world_model.train()
+        self.agent.eval()
         start_time = time.time()
 
         obs, action, reward, termination = self.replay_buffer.sample(self.cfg.training.batch_size, self.cfg.training.demonstration_batch_size, self.cfg.training.batch_length,
@@ -223,6 +235,7 @@ class Trainer:
             )
         imagine_time = time.time() - start_time
 
+        self.agent.train()
         start_time = time.time()
         logs = self.agent.update(
             latent=imagine_latent,

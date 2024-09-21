@@ -184,6 +184,8 @@ class Trainer:
         return context_obs, context_action, sum_reward, current_obs, current_info
     
     def train_world_model(self) -> None:
+        self.world_model.train()
+        self.agent.eval()
         start_time = time.time()
 
         obs, action, reward, termination = self.replay_buffer.sample(self.cfg.training.batch_size, self.cfg.training.demonstration_batch_size, self.cfg.training.batch_length)
@@ -218,6 +220,7 @@ class Trainer:
             )
         imagine_time = time.time() - start_time
 
+        self.agent.train()
         start_time = time.time()
         logs = self.agent.update(
             latent=imagine_latent,

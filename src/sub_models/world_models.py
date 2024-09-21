@@ -407,7 +407,6 @@ class WorldModel(nn.Module):
         return states, self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer, rollout
 
     def update(self, obs, action, reward, termination, logger=None):
-        self.train()
         batch_size, batch_length = obs.shape[:2]
 
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
@@ -486,9 +485,11 @@ class WorldModel(nn.Module):
                 context_latent[:, i:i+1],
                 sample_action[:, i:i+1],
             )
-            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+            obs_hat_list.append(last_obs_hat[::max(1, imagine_batch_size//16)])  # uniform sample vec_env
         self.latent_buffer[:, 0:1] = last_latent
         self.hidden_buffer[:, 0:1] = last_dist_feat
+        self.reward_hat_buffer[:, 0:1] = last_reward_hat
+        self.termination_hat_buffer[:, 0:1] = last_termination_hat
 
         # imagine
         for i in range(imagine_batch_length):
@@ -502,10 +503,10 @@ class WorldModel(nn.Module):
             self.hidden_buffer[:, i+1:i+2] = last_dist_feat
             self.reward_hat_buffer[:, i:i+1] = last_reward_hat
             self.termination_hat_buffer[:, i:i+1] = last_termination_hat
-            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+            obs_hat_list.append(last_obs_hat[::max(1, imagine_batch_size//16)])  # uniform sample vec_env
 
-        sample_obs = sample_obs[::imagine_batch_size//16]
-        gt_obs = gt_obs[::imagine_batch_size//16]
+        sample_obs = sample_obs[::max(1, imagine_batch_size//16)]
+        gt_obs = gt_obs[::max(1, imagine_batch_size//16)]
         obs = torch.cat([sample_obs, gt_obs], dim=1)
         obs_hat = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1)
         video = torch.cat([obs.unsqueeze(2), obs_hat.unsqueeze(2)], dim=2).cpu().detach() # B T K C H W

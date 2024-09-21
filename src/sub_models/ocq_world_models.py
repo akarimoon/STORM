@@ -575,6 +575,8 @@ class OCQuantizedWorldModel(nn.Module):
         self.dist_head.load_state_dict(extract_state_dict(state_dict, 'dist_head'))
         self.image_decoder.load_state_dict(extract_state_dict(state_dict, 'image_decoder'))
         self.pos_embed.load_state_dict(extract_state_dict(state_dict, 'pos_embed'))
+        self.storm_transformer.load_state_dict(extract_state_dict(state_dict, 'storm_transformer'))
+        self.slot_proj.load_state_dict(extract_state_dict(state_dict, 'slot_proj'))
 
         # self.slot_attn._reset_slots()
 
@@ -798,7 +800,6 @@ class OCQuantizedWorldModel(nn.Module):
         return states, self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer, rollout
 
     def update(self, obs, action, reward, termination, logger=None):
-        self.train()
         
         batch_size, batch_length = obs.shape[:2]
         H, W = obs.shape[-2:]
@@ -1017,10 +1018,12 @@ class OCQuantizedWorldModel(nn.Module):
                 None,
                 sample_action[:, i:i+1]
             )
-            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
-            attns_list.append(last_attns[::imagine_batch_size//16])  # uniform sample vec_env
+            obs_hat_list.append(last_obs_hat[::max(1, imagine_batch_size//16)])  # uniform sample vec_env
+            attns_list.append(last_attns[::max(1, imagine_batch_size//16)])  # uniform sample vec_env
         self.latent_buffer[:, 0:1] = last_latent
         self.hidden_buffer[:, 0:1] = last_hidden
+        self.reward_hat_buffer[:, 0:1] = last_reward_hat
+        self.termination_hat_buffer[:, 0:1] = last_termination_hat
 
         # imagine
         imagine_length = imagine_batch_length
@@ -1035,11 +1038,13 @@ class OCQuantizedWorldModel(nn.Module):
 
             self.latent_buffer[:, i+1:i+2] = last_latent
             self.hidden_buffer[:, i+1:i+2] = last_hidden
-            obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
-            attns_list.append(last_attns[::imagine_batch_size//16])  # uniform sample vec_env
+            self.reward_hat_buffer[:, i:i+1] = last_reward_hat
+            self.termination_hat_buffer[:, i:i+1] = last_termination_hat
+            obs_hat_list.append(last_obs_hat[::max(1, imagine_batch_size//16)])  # uniform sample vec_env
+            attns_list.append(last_attns[::max(1, imagine_batch_size//16)])  # uniform sample vec_env
 
-        sample_obs = sample_obs[::imagine_batch_size//16]
-        gt_obs = gt_obs[::imagine_batch_size//16]
+        sample_obs = sample_obs[::max(1, imagine_batch_size//16)]
+        gt_obs = gt_obs[::max(1, imagine_batch_size//16)]
         obs = torch.cat([sample_obs, gt_obs], dim=1)
         obs_hat_list = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1)
         attns_list = torch.cat(attns_list, dim=1)
