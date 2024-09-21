@@ -136,7 +136,6 @@ class ActorCriticAgent(nn.Module):
         '''
         Update policy and value model
         '''
-        self.train()
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             logits, raw_value = self.get_logits_raw_value(latent)
             dist = distributions.Categorical(logits=logits[:, :-1])
@@ -248,44 +247,37 @@ class OCActorCriticAgent(ActorCriticAgent):
         super().__init__(feat_dim, mlp_num_layers, mlp_hidden_dim, action_dim, gamma, lambd, entropy_coef, lr, max_grad_norm)
 
         if pool_type == 'transformer':
-            shared_layer = TransformerWithCLS(feat_dim, transformer_hidden_dim, transformer_num_heads, transformer_num_layers)
+            pool_layer = TransformerWithCLS(feat_dim, transformer_hidden_dim, transformer_num_heads, transformer_num_layers)
+            shared_layer = nn.Sequential(
+                nn.Linear(transformer_hidden_dim, mlp_hidden_dim),
+                nn.LayerNorm(mlp_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
+                nn.LayerNorm(mlp_hidden_dim),
+                nn.ReLU(inplace=True)
+            )
+            self.actor = nn.Sequential(
+                pool_layer,
+                shared_layer,
+                nn.Linear(mlp_hidden_dim, action_dim)
+            )
+            self.critic = nn.Sequential(
+                pool_layer,
+                shared_layer,
+                nn.Linear(mlp_hidden_dim, 255)
+            )
         elif pool_type == 'mlp':
-            shared_layer = MLP(feat_dim, transformer_hidden_dim)
-
-        actor = [
-            nn.Linear(transformer_hidden_dim, mlp_hidden_dim, bias=False),
-            nn.LayerNorm(mlp_hidden_dim),
-            nn.ReLU()
-        ]
-        for i in range(mlp_num_layers - 1):
-            actor.extend([
-                nn.Linear(mlp_hidden_dim, mlp_hidden_dim, bias=False),
-                nn.LayerNorm(mlp_hidden_dim),
-                nn.ReLU()
-            ])
-        self.actor = nn.Sequential(
-            shared_layer,
-            *actor,
-            nn.Linear(mlp_hidden_dim, action_dim)
-        )
-
-        critic = [
-            nn.Linear(transformer_hidden_dim, mlp_hidden_dim, bias=False),
-            nn.LayerNorm(mlp_hidden_dim),
-            nn.ReLU()
-        ]
-        for i in range(mlp_num_layers - 1):
-            critic.extend([
-                nn.Linear(mlp_hidden_dim, mlp_hidden_dim, bias=False),
-                nn.LayerNorm(mlp_hidden_dim),
-                nn.ReLU()
-            ])
-
-        self.critic = nn.Sequential(
-            shared_layer,
-            *critic,
-            nn.Linear(mlp_hidden_dim, 255)
-        )
+            pool_layer = MLP(feat_dim, mlp_hidden_dim)
+            self.actor = nn.Sequential(
+                pool_layer,
+                # *actor,
+                nn.Linear(mlp_hidden_dim, action_dim)
+            )
+            self.critic = nn.Sequential(
+                pool_layer,
+                # *critic,
+                nn.Linear(mlp_hidden_dim, 255)
+            )
 
         self.slow_critic = copy.deepcopy(self.critic)
 
