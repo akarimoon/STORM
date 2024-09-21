@@ -75,8 +75,8 @@ world_model:
   max_grad_norm_tf: 1000.0
   max_grad_norm_rt: 1000.0
   coef_recon: 1.0
-  coef_dyn: 1.0
-  coef_stat: 1.0
+  coef_dyn: 1.5
+  coef_stat: 0.5
   #############################
   in_channels: 3
   stem_channels: 64
@@ -91,11 +91,11 @@ world_model:
   transformer_num_layers: 2
   transformer_num_heads: 8
   transformer_max_length: 64
-  emb_type: 2emb
+  emb_type: 1emb_repeat
   skip_connection: False
   stochastic_slots: False
   post_type: mlp
-  mask_type: block
+  mask_type: subsequent
   agent_state_type: both
   vis_attn_type: sbd
   imagine_with: latent
@@ -116,6 +116,6 @@ agent:
   mlp_hidden_dim: 64
   gamma: 0.985
   lambd: 0.95
-  entropy_coef: 1.0e-3
-  lr: 1.0e-5 # 5.0e-5
-  max_grad_norm: 0.2
+  entropy_coef: 0.01
+  lr: 0.0001
+  max_grad_norm: 0.1
