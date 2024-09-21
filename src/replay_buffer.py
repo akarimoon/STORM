@@ -183,6 +183,18 @@ class OCRLReplayBuffer():
         pad_right = torch.nn.functional.pad(x, [0 for _ in range(2 * x.ndim - 1)] + [padding_length_right]) if padding_length_right > 0 else x
         return torch.nn.functional.pad(pad_right, [0 for _ in range(2 * x.ndim - 2)] + [padding_length_left, 0]) if padding_length_left > 0 else pad_right
 
+    def get_stats(self):
+        collected_episodes = self.episode_pointer
+        if self.store_on_gpu:
+            collected_successful_episodes = torch.sum(self.reward_buffer[:collected_episodes].sum(1) > 0).item()
+        else:
+            collected_successful_episodes = np.sum(np.sum(self.reward_buffer[:collected_episodes], axis=1) > 0)
+        return {
+            "replay_buffer/num_episodes": collected_episodes,
+            "replay_buffer/num_successful_episodes": collected_successful_episodes,
+            "replay_buffer/success_rate": collected_successful_episodes / collected_episodes if collected_episodes > 0 else 0,
+        }
+
     @torch.no_grad()
     def sample(self, batch_size, external_batch_size, batch_length, sample_from_start=True, to_device="cuda"):
         assert external_batch_size == 0, "OCRLReplayBuffer does not support external buffer"
@@ -190,7 +202,7 @@ class OCRLReplayBuffer():
 
         if self.store_on_gpu:
             obs, action, reward, termination = [], [], [], []
-            if batch_size > 0:
+            if batch_size > 1:
                 indexes = np.random.randint(0, num_episodes, size=batch_size)
                 for id in indexes:
                     # start = np.random.randint(0, self.episode_length_buffer[id]+1-batch_length)
@@ -214,6 +226,14 @@ class OCRLReplayBuffer():
                     action.append(self.pad(self.action_buffer[id, start:stop], padding_length_left, padding_length_right))
                     reward.append(self.pad(self.reward_buffer[id, start:stop], padding_length_left, padding_length_right))
                     termination.append(self.pad(self.termination_buffer[id, start:stop], padding_length_left, padding_length_right))
+            elif batch_size == 1:
+                indexes = np.random.randint(0, num_episodes, size=batch_size)
+                id = indexes[0]
+
+                obs.append(self.obs_buffer[id, :self.episode_length_buffer[id]])
+                action.append(self.action_buffer[id, :self.episode_length_buffer[id]])
+                reward.append(self.reward_buffer[id, :self.episode_length_buffer[id]])
+                termination.append(self.termination_buffer[id, :self.episode_length_buffer[id]])
 
             obs = torch.stack(obs, dim=0).float() / 255
             obs = rearrange(obs, "B T H W C -> B T C H W")
@@ -222,7 +242,7 @@ class OCRLReplayBuffer():
             termination = torch.stack(termination, dim=0)
         else:
             obs, action, reward, termination = [], [], [], []
-            if batch_size > 0:
+            if batch_size > 1:
                 indexes = np.random.randint(0, num_episodes, size=batch_size)
                 for id in indexes:
                     start = np.random.randint(0, self.episode_length_buffer[id]+1-batch_length)
@@ -230,6 +250,14 @@ class OCRLReplayBuffer():
                     action.append(self.action_buffer[id, start:start+batch_length])
                     reward.append(self.reward_buffer[id, start:start+batch_length])
                     termination.append(self.termination_buffer[id, start:start+batch_length])
+            elif batch_size == 1:
+                indexes = np.random.randint(0, num_episodes, size=batch_size)
+                id = indexes[0]
+
+                obs.append(self.obs_buffer[id, :self.episode_length_buffer[id]])
+                action.append(self.action_buffer[id, :self.episode_length_buffer[id]])
+                reward.append(self.reward_buffer[id, :self.episode_length_buffer[id]])
+                termination.append(self.termination_buffer[id, :self.episode_length_buffer[id]])
 
             obs = torch.from_numpy(np.array(obs, axis=0)).float().to(self.device) / 255
             obs = rearrange(obs, "B T H W C -> B T C H W")
