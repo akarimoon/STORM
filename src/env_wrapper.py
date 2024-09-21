@@ -183,25 +183,40 @@ if __name__ == "__main__":
             return torch.nn.functional.pad(pad_right, [0 for _ in range(2 * x.ndim - 2)] + [padding_length_left, 0]) if padding_length_left > 0 else pad_right
 
         all_episodes, episode_length = [], []
+        all_rewards = []
         max_episode_length = 50
         num_save = 10
         for _ in range(100):
             episode = []
+            rewards = []
 
             current_obs, current_info = env.reset()
             done = False
             while not done:
                 action = env.action_space.sample()
+                action = 0
                 obs, reward, done, truncated, info = env.step(action)
                 if done:
                     episode_length.append(info["episode_frame_number"])
                 episode.append(current_obs[0])
+                rewards.append(reward)
                 current_obs = obs
             all_episodes.append(pad(torch.tensor(episode[:max_episode_length]), 0, max_episode_length - len(episode)))
+            all_rewards.append(np.array(rewards))
 
         all_episodes = torch.stack(all_episodes)[:num_save] / 255.0
         all_episodes = rearrange(all_episodes, 'b t h w c -> (b t) c h w')
         save_image(all_episodes, "block_env.png", nrow=max_episode_length, pad_value=1.0)
 
+        plt.figure(figsize=(10, 5))
         plt.hist(episode_length, bins=20)
         plt.savefig("episode_length.png")
+
+        # for rewards in all_rewards[:num_save]:
+        #     print(rewards)
+        #     print(sum(rewards))
+
+        all_rewards = np.array([sum(rewards) for rewards in all_rewards])
+        plt.figure(figsize=(10, 5))
+        plt.hist(all_rewards, bins=20)
+        plt.savefig("rewards.png")
