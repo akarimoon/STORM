@@ -269,17 +269,17 @@ class Trainer:
         
         all_rewards = []
         for _ in range(self.cfg.evaluation.num_episodes):
-            current_obs, info = self.test_env.reset()
-            context_obs = deque(maxlen=16)
-            context_action = deque(maxlen=16)
-            context_obs.append(rearrange(torch.Tensor(current_obs).to(self.device), "B H W C -> B 1 C H W")/255)
-            context_action.append(self.test_env.action_space.sample())
+            cur_obs_test, info = self.test_env.reset()
+            cont_obs_test = deque(maxlen=16)
+            cont_act_test = deque(maxlen=16)
+            cont_obs_test.append(rearrange(torch.Tensor(cur_obs_test).to(self.device), "B H W C -> B 1 C H W")/255)
+            cont_act_test.append(self.test_env.action_space.sample())
 
             done = False
             rewards = 0
             while not done:
-                context_latent = self.world_model.encode_obs(torch.cat(list(context_obs), dim=1))
-                model_context_action = np.stack(list(context_action), axis=1)
+                context_latent = self.world_model.encode_obs(torch.cat(list(cont_obs_test), dim=1))
+                model_context_action = np.stack(list(cont_act_test), axis=1)
                 model_context_action = torch.Tensor(model_context_action).to(self.device)
                 prior_flattened_sample, last_dist_feat = self.world_model.calc_last_dist_feat(context_latent, model_context_action)
                 if self.world_model.agent_state_type == "latent":
@@ -290,9 +290,9 @@ class Trainer:
                     state = torch.cat([prior_flattened_sample, last_dist_feat], dim=-1)
                 action = self.agent.sample_as_env_action(state, greedy=False)
                 
-                current_obs, reward, done, truncated, info = self.test_env.step(action)
-                context_obs.append(rearrange(torch.Tensor(current_obs).to(self.device), "B H W C -> B 1 C H W")/255)
-                context_action.append(action)
+                cur_obs_test, reward, done, truncated, info = self.test_env.step(action)
+                cont_obs_test.append(rearrange(torch.Tensor(cur_obs_test).to(self.device), "B H W C -> B 1 C H W")/255)
+                cont_act_test.append(action)
 
                 rewards += reward
             all_rewards.append(rewards)
@@ -324,10 +324,10 @@ class Trainer:
         with torch.no_grad():
             sample_obs, sample_action, sample_reward, sample_termination = self.replay_buffer.sample(
                 self.cfg.training.inspect_batch_size, 0, self.cfg.training.inspect_context_length+self.cfg.training.inspect_batch_length)
-            context_obs, context_action = sample_obs[:, :self.cfg.training.inspect_context_length], sample_action[:, :self.cfg.training.inspect_context_length]
+            cond_obs, cond_action = sample_obs[:, :self.cfg.training.inspect_context_length], sample_action[:, :self.cfg.training.inspect_context_length]
             gt_obs, gt_action = sample_obs[:, self.cfg.training.inspect_context_length:], sample_action[:, self.cfg.training.inspect_context_length:]
             video = self.world_model.inspect_rollout(
-                context_obs, context_action, gt_obs, gt_action,
+                cond_obs, cond_action, gt_obs, gt_action,
                 imagine_batch_size=self.cfg.training.inspect_batch_size,
                 imagine_batch_length=self.cfg.training.inspect_batch_length,
             )

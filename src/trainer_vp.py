@@ -197,10 +197,10 @@ class Trainer:
         with torch.no_grad():
             sample_obs, sample_action, sample_reward, sample_termination = self.replay_buffer.sample(
                 self.cfg.training.inspect_batch_size, 0, self.cfg.training.inspect_context_length+self.cfg.training.inspect_batch_length)
-            context_obs, context_action = sample_obs[:, :self.cfg.training.inspect_context_length], sample_action[:, :self.cfg.training.inspect_context_length]
+            cond_obs, cond_action = sample_obs[:, :self.cfg.training.inspect_context_length], sample_action[:, :self.cfg.training.inspect_context_length]
             gt_obs, gt_action = sample_obs[:, self.cfg.training.inspect_context_length:], sample_action[:, self.cfg.training.inspect_context_length:]
             video = self.world_model.inspect_rollout(
-                context_obs, context_action, gt_obs, gt_action,
+                cond_obs, cond_action, gt_obs, gt_action,
                 imagine_batch_size=self.cfg.training.inspect_batch_size,
                 imagine_batch_length=self.cfg.training.inspect_batch_length,
             )
