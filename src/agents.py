@@ -218,8 +218,9 @@ class TransformerWithCLS(nn.Module):
     
 
 class MLP(nn.Module):
-    def __init__(self, in_features, d_model):
+    def __init__(self, in_features, d_model, pool_type):
         super(MLP, self).__init__()
+        self.pool_type = pool_type
         self._linear = nn.Sequential(
             nn.Linear(in_features, d_model),
             nn.LayerNorm(d_model),
@@ -232,7 +233,10 @@ class MLP(nn.Module):
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         B, L = state.shape[:2]
         state = rearrange(state, "B L N D -> (B L) N D")
-        state = state.sum(dim=1)
+        if self.pool_type == 'first':
+            state = state[:, 0]
+        else:
+            state = state.sum(dim=1)
 
         feats = self._linear(state)
         feats = rearrange(feats, "(B L) D -> B L D", B=B)
@@ -266,8 +270,8 @@ class OCActorCriticAgent(ActorCriticAgent):
                 shared_layer,
                 nn.Linear(mlp_hidden_dim, 255)
             )
-        elif pool_type == 'mlp':
-            pool_layer = MLP(feat_dim, mlp_hidden_dim)
+        elif pool_type == 'mlp' or pool_type == 'first':
+            pool_layer = MLP(feat_dim, mlp_hidden_dim, pool_type)
             self.actor = nn.Sequential(
                 pool_layer,
                 # *actor,
@@ -286,6 +290,6 @@ class OCActorCriticAgent(ActorCriticAgent):
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.max_grad_norm, eps=1e-5)
         self.scheduler = None
-        # self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=linear_warmup_exp_decay(15000))
+        # self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=linear_warmup_exp_decay(50000))
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
