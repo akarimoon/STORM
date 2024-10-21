@@ -48,6 +48,8 @@ training:
   imagine_batch_length: 20
   train_dynamics_every_steps: 1
   train_agent_every_steps: 1
+  start_train_dynamics_steps: 0
+  start_train_agent_steps: 0
   use_demonstration: False
   trajectory_path: null
   #############################
@@ -99,6 +101,7 @@ world_model:
   agent_state_type: both
   vis_attn_type: sbd
   imagine_with: latent
+  rt_pool_type: ${agent.pool_type}
   sbd_target: z_q # [onehot, soft, z_q]
   separate_dist_head: False
   loss_config:

@@ -47,6 +47,8 @@ training:
   imagine_batch_length: 20
   train_dynamics_every_steps: 1
   train_agent_every_steps: 1
+  start_train_dynamics_steps: 0
+  start_train_agent_steps: 0
   use_demonstration: False
   trajectory_path: null
   #############################
