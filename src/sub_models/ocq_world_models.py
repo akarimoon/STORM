@@ -337,9 +337,40 @@ class DistHead(nn.Module):
         return logits, sample, mask_as_image
 
 
+class TransformerWithCLS(nn.Module):
+    def __init__(self, in_features, d_model, num_heads, num_layers, norm_first=False):
+        super(TransformerWithCLS, self).__init__()
+        self._linear = nn.Linear(in_features, d_model) if in_features > d_model else nn.Identity()
+        self._cls_token = nn.Parameter(torch.zeros(d_model))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, num_heads,
+            batch_first=True,
+            #norm_first=norm_first
+        )
+        self._trans = nn.TransformerEncoder(encoder_layer, num_layers)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        B, L = state.shape[:2]
+        state = rearrange(state, "B L N D -> (B L) N D")
+
+        state = self._linear(state)
+        state = torch.cat(
+            [self._cls_token.repeat(B*L, 1, 1), state], dim=1
+        )
+
+        feats = self._trans(state)[:, 0]
+        feats = rearrange(feats, "(B L) D -> B L D", B=B)
+
+        return feats
+
+
 class RewardDecoder(nn.Module):
-    def __init__(self, num_classes, embedding_size, input_dim, hidden_dim) -> None:
+    def __init__(self, num_classes, rt_pool_type, input_dim, hidden_dim) -> None:
         super().__init__()
+        self.rt_pool_type = rt_pool_type
+
+        if rt_pool_type == "transformer":
+            self.pool = TransformerWithCLS(input_dim, hidden_dim, num_heads=8, num_layers=1)
         self.backbone = nn.Sequential(
             nn.Linear(input_dim, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
@@ -351,15 +382,24 @@ class RewardDecoder(nn.Module):
         self.head = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, feat):
-        feat = feat.sum(dim=-2)
+        if self.rt_pool_type == "transformer":
+            feat = self.pool(feat)
+        elif self.rt_pool_type == "first":
+            feat = feat[:, :, 0]
+        else:
+            feat = feat.sum(dim=-2)
         feat = self.backbone(feat)
         reward = self.head(feat)
         return reward
 
 
 class TerminationDecoder(nn.Module):
-    def __init__(self, embedding_size, input_dim, hidden_dim) -> None:
+    def __init__(self, rt_pool_type, input_dim, hidden_dim) -> None:
         super().__init__()
+        self.rt_pool_type = rt_pool_type
+
+        if rt_pool_type == "transformer":
+            self.pool = TransformerWithCLS(input_dim, hidden_dim, num_heads=8, num_layers=1)
         self.backbone = nn.Sequential(
             nn.Linear(input_dim, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
@@ -374,7 +414,12 @@ class TerminationDecoder(nn.Module):
         )
 
     def forward(self, feat):
-        feat = feat.sum(dim=-2)
+        if self.rt_pool_type == "transformer":
+            feat = self.pool(feat)
+        elif self.rt_pool_type == "first":
+            feat = feat[:, :, 0]
+        else:
+            feat = feat.sum(dim=-2)
         feat = self.backbone(feat)
         termination = self.head(feat)
         termination = termination.squeeze(-1)  # remove last 1 dim
@@ -384,7 +429,7 @@ class TerminationDecoder(nn.Module):
 class OCQuantizedWorldModel(nn.Module):
     def __init__(self, in_channels, action_dim, stem_channels, stoch_num_classes, stoch_dim, num_slots, slot_dim, dec_hidden_dim, dec_num_layers, vocab_size, sbd_target,
                  transformer_hidden_dim, transformer_num_layers, transformer_num_heads, transformer_max_length, emb_type, skip_connection, stochastic_slots, separate_dist_head,
-                 post_type, mask_type, loss_config, agent_state_type, vis_attn_type, imagine_with,
+                 post_type, mask_type, loss_config, agent_state_type, vis_attn_type, imagine_with, rt_pool_type,
                  lr_vae, lr_sa, lr_dec, lr_tf, lr_rt, max_grad_norm_vae, max_grad_norm_sa, max_grad_norm_dec, max_grad_norm_tf, max_grad_norm_rt,
                  coef_dyn, coef_stat, coef_recon) -> None:
         super().__init__()
@@ -465,12 +510,12 @@ class OCQuantizedWorldModel(nn.Module):
         )
         self.reward_decoder = RewardDecoder(
             num_classes=255,
-            embedding_size=self.stoch_flattened_dim,
+            rt_pool_type=rt_pool_type,
             input_dim=transformer_hidden_dim,
             hidden_dim=transformer_hidden_dim
         )
         self.termination_decoder = TerminationDecoder(
-            embedding_size=self.stoch_flattened_dim,
+            rt_pool_type=rt_pool_type,
             input_dim=transformer_hidden_dim,
             hidden_dim=transformer_hidden_dim
         )
@@ -493,6 +538,13 @@ class OCQuantizedWorldModel(nn.Module):
             self.prior_slots_mu = nn.Linear(slot_dim, slot_dim)
             self.prior_slots_sigma = nn.Linear(slot_dim, slot_dim)
 
+        self.use_harmony = loss_config.get("use_harmony", False)
+        if self.use_harmony:
+            self.harmony_s0 = torch.nn.Parameter(-torch.log(torch.tensor(1.0)))  # recon
+            self.harmony_s1 = torch.nn.Parameter(-torch.log(torch.tensor(1.0)))  # reward
+            self.harmony_s2 = torch.nn.Parameter(-torch.log(torch.tensor(1.0)))  # image
+            self.harmony_s3 = torch.nn.Parameter(-torch.log(torch.tensor(1.0)))  # kl
+
         self.mse_loss_func = MSELoss()
         self.ce_loss = CELoss()
         self.kl_loss_func = KLLoss()
@@ -512,7 +564,7 @@ class OCQuantizedWorldModel(nn.Module):
         # self.scheduler_dec = torch.optim.lr_scheduler.LambdaLR(self.optimizer_sa, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps, 0.5, 250000))
         self.scheduler_tf = None
         self.scheduler_rt = None
-        # self.scheduler_rt = torch.optim.lr_scheduler.LambdaLR(self.optimizer_rt, lr_lambda=linear_warmup_exp_decay(lr_warmup_steps))
+        # self.scheduler_rt = torch.optim.lr_scheduler.LambdaLR(self.optimizer_rt, lr_lambda=linear_warmup_exp_decay(50000))
         self.max_grad_norm_vae = max_grad_norm_vae
         self.max_grad_norm_sa = max_grad_norm_sa
         self.max_grad_norm_dec = max_grad_norm_dec
@@ -554,6 +606,12 @@ class OCQuantizedWorldModel(nn.Module):
         )
 
     def _get_tf_params(self):
+        if self.use_harmony:
+            return chain(
+                self.storm_transformer.parameters(),
+                self.slot_proj.parameters(),
+                [self.harmony_s0, self.harmony_s1, self.harmony_s2, self.harmony_s3]
+            )
         return chain(
             self.storm_transformer.parameters(),
             self.slot_proj.parameters(),
@@ -846,21 +904,33 @@ class OCQuantizedWorldModel(nn.Module):
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
 
-            total_loss += self.coef_recon * reconstruction_loss + self.coef_dyn * (reward_loss + termination_loss)
+            if self.use_harmony:
+                # total_loss += reconstruction_loss / (torch.exp(self.harmony_s0)) + (reward_loss + termination_loss) / (torch.exp(self.harmony_s3))
+                total_loss += self.coef_recon * reconstruction_loss / (torch.exp(self.harmony_s0)) + self.coef_dyn * (reward_loss + termination_loss) / (torch.exp(self.harmony_s3))
+            else:
+                total_loss += self.coef_recon * reconstruction_loss + self.coef_dyn * (reward_loss + termination_loss)
             
             ce_loss = self.get_ce_loss(prior_logits[:, :-1], post_logits[:, 1:], soft[:, 1:], z_q[:, 1:])
             total_loss += self.coef_dyn * ce_loss
 
             if self.loss_config.recon_z:
                 ce_recon_loss = self.get_ce_loss(recon_logits, post_logits, soft, z_q)
-                total_loss += self.coef_stat * ce_recon_loss
+                if self.use_harmony:
+                    # total_loss += ce_recon_loss / (torch.exp(self.harmony_s1))
+                    total_loss += self.coef_stat * ce_recon_loss / (torch.exp(self.harmony_s1))
+                else:
+                    total_loss += self.coef_stat * ce_recon_loss
 
             if self.loss_config.recon_x_from_slots:
                 obs_hat_from_recon = self.image_decoder(recon_sample)
                 obs_hat_from_prior = self.image_decoder(prior_sample)
                 recon_curr_loss = self.mse_loss_func(obs_hat_from_recon, obs)
                 recon_next_loss = self.mse_loss_func(obs_hat_from_prior[:, :-1], obs[:, 1:])
-                total_loss += self.coef_stat * recon_curr_loss + self.coef_dyn * recon_next_loss
+                if self.use_harmony:
+                    # total_loss += recon_curr_loss / (torch.exp(self.harmony_s1)) + recon_next_loss / (torch.exp(self.harmony_s2))
+                    total_loss += self.coef_stat * recon_curr_loss / (torch.exp(self.harmony_s1)) + self.coef_dyn * recon_next_loss / (torch.exp(self.harmony_s2))
+                else:
+                    total_loss += self.coef_stat * recon_curr_loss + self.coef_dyn * recon_next_loss
             
             if self.stochastic_slots:
                 # kl_loss = self.kl_loss_func(prior_mu, prior_sigma, post_mu, post_sigma)
@@ -958,6 +1028,14 @@ class OCQuantizedWorldModel(nn.Module):
         if self.stochastic_slots:
             logs.update({
                 "world_model/kl_loss": kl_loss.item(),
+            })
+
+        if self.use_harmony:
+            logs.update({
+                "world_model/harmony_recon": self.harmony_s0.item(),
+                "world_model/harmony_stat": self.harmony_s1.item(),
+                "world_model/harmony_dyn": self.harmony_s2.item(),
+                "world_model/harmony_rt": self.harmony_s3.item(),
             })
 
         return logs, video
