@@ -58,7 +58,7 @@ def main(config_name, checkpoint_path):
         agent.load_state_dict(torch.load(os.path.join("outputs/2024-08-17/09-05-45", "checkpoints", "agent.pth"), map_location=device))
 
     # build replay buffer
-    replay_buffer = instantiate(cfg.replay_buffer, obs_shape=(cfg.common.image_size, cfg.common.image_size, 3), num_envs=cfg.envs.num_envs, device=device)
+    replay_buffer = instantiate(cfg.replay_buffer, obs_shape=(cfg.common.image_size, cfg.common.image_size, 3), num_envs=cfg.envs.num_envs, device=device, dreamsmooth=cfg.replay_buffer.get("dreamsmooth", None))
     num_envs = cfg.envs.num_envs
 
     world_model.eval()

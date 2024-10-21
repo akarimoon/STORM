@@ -48,11 +48,12 @@ def main(config_name, checkpoint_path):
     if checkpoint_path is not None:
         path_to_checkpoint = checkpoint_path
         print(colorama.Fore.MAGENTA + f"loading pretrained model from {path_to_checkpoint}" + colorama.Style.RESET_ALL)
-        world_model.load(os.path.join(path_to_checkpoint, "checkpoints", "world_model.pth"), device)
+        # world_model.load(os.path.join(path_to_checkpoint, "checkpoints", "world_model.pth"), device)
+        world_model.load_state_dict(torch.load(os.path.join(path_to_checkpoint, "checkpoints", "world_model.pth"), map_location=device))
         agent.load(os.path.join(path_to_checkpoint, "checkpoints", "agent.pth"), device)
 
     # build replay buffer
-    replay_buffer = instantiate(cfg.replay_buffer, obs_shape=(cfg.common.image_size, cfg.common.image_size, 3), num_envs=cfg.envs.num_envs, device=device)
+    replay_buffer = instantiate(cfg.replay_buffer, obs_shape=(cfg.common.image_size, cfg.common.image_size, 3), num_envs=cfg.envs.num_envs, device=device, dreamsmooth=cfg.replay_buffer.get("dreamsmooth", None))
     num_envs = cfg.envs.num_envs
 
     world_model.eval()
@@ -68,7 +69,7 @@ def main(config_name, checkpoint_path):
     context_action = deque(maxlen=16)
 
     final_rewards = []
-    while True:
+    for i in tqdm(range(100)):
         with torch.no_grad():
             if len(context_action) == 0:
                 action = vec_env.action_space.sample()
@@ -113,7 +114,7 @@ def main(config_name, checkpoint_path):
                     current_obs, current_info = vec_env.reset()
                     context_obs = deque(maxlen=16)
                     context_action = deque(maxlen=16)
-                    print("Mean reward: " + colorama.Fore.YELLOW + f"{np.mean(final_rewards)}" + colorama.Style.RESET_ALL)
+    print("Mean reward: " + colorama.Fore.YELLOW + f"{np.mean(final_rewards)}" + colorama.Style.RESET_ALL)
 
 
 if __name__ == "__main__":

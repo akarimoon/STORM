@@ -5,6 +5,7 @@ import torch
 from einops import rearrange
 import copy
 import pickle
+import scipy
 
 
 class ReplayBuffer():
@@ -128,7 +129,7 @@ class ReplayBuffer():
 
 
 class OCRLReplayBuffer():
-    def __init__(self, obs_shape, num_envs, max_length, max_episodes=int(1E6), warmup_length=50000, store_on_gpu=False, device="cuda") -> None:
+    def __init__(self, obs_shape, num_envs, max_length, max_episodes=int(1E6), warmup_length=50000, store_on_gpu=False, dreamsmooth=None, device="cuda") -> None:
         assert num_envs == 1, "OCRLReplayBuffer only supports num_envs=1"
 
         self.store_on_gpu = store_on_gpu
@@ -153,6 +154,7 @@ class OCRLReplayBuffer():
         self.warmup_length = warmup_length
         self.external_buffer_length = None
         self.device = device
+        self.dreamsmooth = dreamsmooth
 
     # def load_trajectory(self, path):
     #     buffer = pickle.load(open(path, "rb"))
@@ -194,6 +196,16 @@ class OCRLReplayBuffer():
             "replay_buffer/num_successful_episodes": collected_successful_episodes,
             "replay_buffer/success_rate": collected_successful_episodes / collected_episodes if collected_episodes > 0 else 0,
         }
+    
+    def smooth(self, reward):
+        if self.dreamsmooth is None:
+            return reward
+        elif "gaussian" in self.dreamsmooth: # "gaussian_xx" where xx is the sigma
+            sigma = float(self.dreamsmooth.split("_")[1])
+            if self.store_on_gpu:
+                device = reward.device
+                return torch.tensor(scipy.ndimage.gaussian_filter1d(reward.cpu().numpy(), sigma=sigma, mode="nearest")).to(device)
+            return scipy.ndimage.gaussian_filter1d(reward, sigma=sigma, mode="nearest")
 
     @torch.no_grad()
     def sample(self, batch_size, external_batch_size, batch_length, sample_from_start=True, to_device="cuda"):
@@ -224,7 +236,7 @@ class OCRLReplayBuffer():
 
                     obs.append(self.pad(self.obs_buffer[id, start:stop], padding_length_left, padding_length_right))
                     action.append(self.pad(self.action_buffer[id, start:stop], padding_length_left, padding_length_right))
-                    reward.append(self.pad(self.reward_buffer[id, start:stop], padding_length_left, padding_length_right))
+                    reward.append(self.pad(self.smooth(self.reward_buffer[id, start:stop]), padding_length_left, padding_length_right))
                     termination.append(self.pad(self.termination_buffer[id, start:stop], padding_length_left, padding_length_right))
             elif batch_size == 1:
                 indexes = np.random.randint(0, num_episodes, size=batch_size)
@@ -232,7 +244,7 @@ class OCRLReplayBuffer():
 
                 obs.append(self.obs_buffer[id, :self.episode_length_buffer[id]])
                 action.append(self.action_buffer[id, :self.episode_length_buffer[id]])
-                reward.append(self.reward_buffer[id, :self.episode_length_buffer[id]])
+                reward.append(self.smooth(self.reward_buffer[id, :self.episode_length_buffer[id]]))
                 termination.append(self.termination_buffer[id, :self.episode_length_buffer[id]])
 
             obs = torch.stack(obs, dim=0).float() / 255

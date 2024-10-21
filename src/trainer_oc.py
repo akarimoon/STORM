@@ -67,12 +67,12 @@ class Trainer:
         if cfg.common.load_pretrained:
             path_to_checkpoint = Path(hydra.utils.get_original_cwd()) / cfg.initialization.pretrained_ckpt
             print(colorama.Fore.MAGENTA + f"loading pretrained model from {path_to_checkpoint}" + colorama.Style.RESET_ALL)
-            # self.world_model.load(path_to_checkpoint, self.device)
-            state_dict = torch.load(path_to_checkpoint, map_location=self.device)
-            self.world_model.load_state_dict(state_dict)
+            self.world_model.load(path_to_checkpoint, self.device)
+            # state_dict = torch.load(path_to_checkpoint, map_location=self.device)
+            # self.world_model.load_state_dict(state_dict)
 
         # build replay buffer
-        self.replay_buffer = instantiate(cfg.replay_buffer, obs_shape=(cfg.common.image_size, cfg.common.image_size, 3), num_envs=cfg.envs.num_envs, device=self.device)
+        self.replay_buffer = instantiate(cfg.replay_buffer, obs_shape=(cfg.common.image_size, cfg.common.image_size, 3), num_envs=cfg.envs.num_envs, dreamsmooth=cfg.replay_buffer.get("dreamsmooth", None), device=self.device)
 
         # judge whether to load demonstration trajectory
         if cfg.training.use_demonstration:
@@ -105,12 +105,12 @@ class Trainer:
                 to_log.append(buffer_stats)
 
                 if self.total_steps % (self.cfg.training.train_dynamics_every_steps//self.num_envs) == 0:
-                    # if self.total_steps >= 100000:
-                    to_log += self.train_world_model()
+                    if self.total_steps >= self.cfg.training.start_train_dynamics_steps:
+                        to_log += self.train_world_model()
 
                 if self.total_steps % (self.cfg.training.train_agent_every_steps//self.num_envs) == 0 and self.total_steps*self.num_envs >= 0:
-                    # if self.total_steps >= 100000:
-                    to_log += self.train_agent()
+                    if self.total_steps >= self.cfg.training.start_train_agent_steps:
+                        to_log += self.train_agent()
 
                 if self.total_steps % (self.cfg.training.save_every_steps//self.num_envs) == 0:
                     self.save()
